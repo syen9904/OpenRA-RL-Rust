@@ -42,4 +42,18 @@ fn parse_real_replay() {
     for (name, count) in sorted {
         eprintln!("  {}: {}", name, count);
     }
+
+    // Count SyncHash packets
+    let sync_packets: Vec<_> = replay.packets.iter()
+        .filter(|p| p.data.len() > 4 && p.data[4] == 0x65) // OrderType.SyncHash
+        .collect();
+    eprintln!("\nSyncHash packets: {}", sync_packets.len());
+    for p in sync_packets.iter().take(5) {
+        if p.data.len() >= 17 {
+            let frame = i32::from_le_bytes(p.data[0..4].try_into().unwrap());
+            let sync_hash = i32::from_le_bytes(p.data[5..9].try_into().unwrap());
+            let defeat_state = u64::from_le_bytes(p.data[9..17].try_into().unwrap());
+            eprintln!("  frame={}, syncHash={}, defeatState={}", frame, sync_hash, defeat_state);
+        }
+    }
 }
