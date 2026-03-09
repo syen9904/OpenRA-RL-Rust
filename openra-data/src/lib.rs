@@ -4,3 +4,5 @@
 //! - `.oramap` map files (terrain, actors, resources)
 //! - SHP/TMP sprite files (unit/building graphics)
 //! - Palette files (color lookup tables)
+
+pub mod orarep;
