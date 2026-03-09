@@ -18,6 +18,12 @@
 
 選 Rust 的原因：bundle ~12 MB vs ~100-200 MB、無 runtime 依賴、golden test 可用 `cargo test` 自動化 debug。代價是確定性風險（C# 跟 Rust 的行為必須 bit-for-bit 一致），靠 golden test 解決。
 
+### Sprite 資產
+
+OpenRA repo 的 `mods/ra/bits/` 包含 ~100 個 .shp sprite 檔 + 地形 tileset（.tem/.sno/.des），共 ~2.2 MB。這些是 OpenRA 團隊自製的 GPL 授權資產（不是 EA 原版），可以合法打包進 WASM bundle。完整的原版高解析度圖需要用戶自己安裝，但基本 sprites 足夠渲染 replay。
+
+動畫定義在 `mods/ra/sequences/*.yaml`（哪些 frame 是走路、攻擊、死亡等）。
+
 ---
 
 ## .orarep 格式
