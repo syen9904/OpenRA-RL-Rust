@@ -5,6 +5,7 @@
 
 const N: usize = 624;
 
+#[derive(Clone)]
 pub struct MersenneTwister {
     mt: [u32; N],
     index: usize,

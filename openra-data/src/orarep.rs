@@ -453,6 +453,27 @@ pub fn parse(data: &[u8]) -> io::Result<Replay> {
     })
 }
 
+impl Replay {
+    /// Extract the RandomSeed from the SyncInfo lobby order.
+    /// The seed is in GlobalSettings/RandomSeed in the SyncInfo target_string.
+    pub fn random_seed(&self) -> Option<i32> {
+        for (_frame, order) in &self.orders {
+            if order.order_string == "SyncInfo" {
+                if let Some(ref ts) = order.target_string {
+                    for line in ts.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("RandomSeed:") {
+                            let val = trimmed["RandomSeed:".len()..].trim();
+                            return val.parse().ok();
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

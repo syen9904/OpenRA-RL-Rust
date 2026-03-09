@@ -23,7 +23,6 @@ fn parse_real_replay() {
 
     if let Some(ref yaml) = replay.metadata_yaml {
         eprintln!("Metadata YAML length: {} bytes", yaml.len());
-        // Print first few lines of metadata
         for line in yaml.lines().take(10) {
             eprintln!("  {}", line);
         }
@@ -42,6 +41,11 @@ fn parse_real_replay() {
     for (name, count) in sorted {
         eprintln!("  {}: {}", name, count);
     }
+
+    // Verify RandomSeed extraction
+    let seed = replay.random_seed();
+    eprintln!("\nRandomSeed: {:?}", seed);
+    assert!(seed.is_some(), "should extract RandomSeed from SyncInfo");
 
     // Count SyncHash packets
     let sync_packets: Vec<_> = replay.packets.iter()
