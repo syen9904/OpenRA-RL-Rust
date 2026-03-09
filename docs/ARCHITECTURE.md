@@ -274,20 +274,46 @@ v1 不做 training。但架構設計保證未來可加：
 // 同一個 API，不同的 caller
 let mut sim = GameSimulation::new(map, rules);
 
-// Replay (v1): orders 從 .orarep 來
+// Replay (v1): orders 從 .orarep 來，雙方 orders 都預錄好
 sim.apply_order(replay_order);
 sim.tick();
 let state = sim.snapshot(); // → WebGL renderer
 
-// Training (future): orders 從 agent API 來
-sim.apply_order(agent_order);
+// Training (future): RL agent + bot AI 各自產生 orders
+sim.apply_order(agent_order);  // RL agent 的行動
+sim.apply_order(bot_order);    // 對手 AI 的行動
 sim.tick();
 let state = sim.snapshot(); // → observation serializer → Python
 ```
 
-Training 額外需要：完整動作空間（21 種）、觀測序列化、reward 計算、PyO3 binding、scripted bot AI、128 instance 並行調度。
+### Training 的前置條件
 
-解決的問題：消除 JIT crash、gRPC 斷線、128 Docker 容器（~44 GB → ~2.5 GB RAM）。
+**對手 AI 是 training 的硬性前提** — 沒有對手就無法訓練。Replay 時雙方 orders 都在 .orarep 裡，不需要 AI。Training 時必須有人即時產生對手的 orders。
+
+三個選項：
+
+| 選項 | 工作量 | 效果 |
+|------|--------|------|
+| **移植 HackyAI** | 大（幾千行 C# 確定性邏輯） | 跟現有 C# training 行為一致，agent 策略可 transfer |
+| **簡化 scripted bot** | 中 | 快速可用，但訓練效果跟 C# 版不同 |
+| **Self-play** | 低（不需要 scripted AI） | 兩個 RL agent 對打，但需要訓練框架支援 |
+
+### Training 額外需要的完整清單
+
+| 工作 | 為什麼 replay 不需要 |
+|------|---------------------|
+| **對手 AI**（上述三選一） | Replay 裡雙方 orders 預錄好 |
+| **遊戲初始化** — 從地圖設定建立新遊戲（spawn 玩家、放 MCV、初始化資源） | Replay 的初始狀態由 .orarep + .oramap 決定 |
+| **勝負判定** — 偵測 game over 條件 | Replay 跑到最後一個 tick 就停 |
+| **完整動作空間**（21 種 action type） | Replay 只需處理 replay 裡出現的 orders |
+| **觀測序列化** — WorldState → Python dict | Replay 交給 WebGL |
+| **Reward 計算** — 8 維 reward vector | Replay 不需要 |
+| **PyO3 binding** | Replay 用 WASM |
+| **128 instance 並行調度** | Replay 只跑一場 |
+
+### 解決的問題
+
+消除 JIT crash、gRPC 斷線、128 Docker 容器（~44 GB → ~2.5 GB RAM）。
 
 ---
 
