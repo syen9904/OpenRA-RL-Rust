@@ -1,0 +1,24 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# WASM
+/openra-wasm/pkg/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Golden test data (large, generated)
+golden/*.json
+
+# Docker
+.docker-cargo-cache/

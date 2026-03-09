@@ -1,0 +1,26 @@
+services:
+  dev:
+    build:
+      context: .
+      target: dev
+    volumes:
+      - .:/app
+      - cargo-cache:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target-cache:/app/target
+    command: cargo test
+
+  # Run a specific test
+  # docker compose run --rm dev cargo test -p openra-sim
+  # docker compose run --rm dev cargo test -p openra-data
+
+  # Interactive shell
+  # docker compose run --rm dev bash
+
+  # Build WASM
+  # docker compose run --rm dev wasm-pack build openra-wasm --target web
+
+volumes:
+  cargo-cache:
+  cargo-git:
+  target-cache:

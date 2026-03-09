@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "openra-sim",
+    "openra-data",
+    "openra-wasm",
+    "openra-train",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+repository = "https://github.com/syen9904/OpenRA-RL-Rust"

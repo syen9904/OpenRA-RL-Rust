@@ -1,0 +1,10 @@
+[package]
+name = "openra-train"
+description = "Training runtime — 128 parallel game simulations for RL agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+openra-sim = { path = "../openra-sim" }
+openra-data = { path = "../openra-data" }

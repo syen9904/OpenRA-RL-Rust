@@ -1,0 +1,13 @@
+[package]
+name = "openra-wasm"
+description = "Browser replay viewer — WebGL renderer compiled to WASM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+openra-sim = { path = "../openra-sim" }
+openra-data = { path = "../openra-data" }

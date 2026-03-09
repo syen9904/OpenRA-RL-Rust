@@ -1,0 +1,8 @@
+[package]
+name = "openra-data"
+description = "File format parsers for .orarep, .oramap, SHP sprites, and palettes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

@@ -1,0 +1,9 @@
+[package]
+name = "openra-sim"
+description = "OpenRA game simulation engine — deterministic, zero-dependency core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Zero external dependencies. This crate is the shared core.
