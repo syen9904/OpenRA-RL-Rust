@@ -7,3 +7,4 @@ license.workspace = true
 
 [dependencies]
 bitflags = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }

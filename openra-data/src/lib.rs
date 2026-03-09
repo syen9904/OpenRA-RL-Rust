@@ -5,4 +5,5 @@
 //! - SHP/TMP sprite files (unit/building graphics)
 //! - Palette files (color lookup tables)
 
+pub mod oramap;
 pub mod orarep;
