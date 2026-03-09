@@ -109,11 +109,20 @@ pub struct RawPacket {
     pub data: Vec<u8>,
 }
 
+/// A SyncHash entry extracted from the replay
+#[derive(Debug, Clone, Copy)]
+pub struct SyncHashEntry {
+    pub frame: i32,
+    pub sync_hash: i32,
+    pub defeat_state: u64,
+}
+
 /// Parsed replay file
 #[derive(Debug)]
 pub struct Replay {
     pub packets: Vec<RawPacket>,
     pub orders: Vec<(i32, Order)>, // (frame, order)
+    pub sync_hashes: Vec<SyncHashEntry>,
     pub tick_count: i32,
     pub metadata_yaml: Option<String>,
 }
@@ -373,6 +382,7 @@ pub fn parse(data: &[u8]) -> io::Result<Replay> {
     let mut cursor = Cursor::new(data);
     let mut packets = Vec::new();
     let mut orders = Vec::new();
+    let mut sync_hashes = Vec::new();
     let mut tick_count: i32 = 0;
 
     let data_len = data.len() as u64;
@@ -397,15 +407,20 @@ pub fn parse(data: &[u8]) -> io::Result<Replay> {
 
         let frame = i32::from_le_bytes(packet_data[0..4].try_into().unwrap());
 
-        // Skip SyncHash and Disconnect packets (not game orders)
+        // Extract SyncHash packets, skip Disconnect
         if packet_data.len() > 4 {
             let order_type = packet_data[4];
-            if order_type == OrderType::SyncHash as u8 || order_type == OrderType::Disconnect as u8 {
-                packets.push(RawPacket {
-                    client_id,
+            if order_type == OrderType::SyncHash as u8 && packet_data.len() >= 17 {
+                sync_hashes.push(SyncHashEntry {
                     frame,
-                    data: packet_data,
+                    sync_hash: i32::from_le_bytes(packet_data[5..9].try_into().unwrap()),
+                    defeat_state: u64::from_le_bytes(packet_data[9..17].try_into().unwrap()),
                 });
+                packets.push(RawPacket { client_id, frame, data: packet_data });
+                continue;
+            }
+            if order_type == OrderType::Disconnect as u8 {
+                packets.push(RawPacket { client_id, frame, data: packet_data });
                 continue;
             }
         }
@@ -432,6 +447,7 @@ pub fn parse(data: &[u8]) -> io::Result<Replay> {
     Ok(Replay {
         packets,
         orders,
+        sync_hashes,
         tick_count,
         metadata_yaml,
     })

@@ -48,7 +48,7 @@ fn parse_real_replay() {
         .filter(|p| p.data.len() > 4 && p.data[4] == 0x65) // OrderType.SyncHash
         .collect();
     eprintln!("\nSyncHash packets: {}", sync_packets.len());
-    for p in sync_packets.iter().take(5) {
+    for p in sync_packets.iter().take(20) {
         if p.data.len() >= 17 {
             let frame = i32::from_le_bytes(p.data[0..4].try_into().unwrap());
             let sync_hash = i32::from_le_bytes(p.data[5..9].try_into().unwrap());
