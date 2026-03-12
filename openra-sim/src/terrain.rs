@@ -114,6 +114,13 @@ impl TerrainMap {
             && *self.occupancy.get(x, y) == 0
     }
 
+    /// Check if a cell is passable for a specific actor (passable if empty or self).
+    pub fn is_passable_for(&self, x: i32, y: i32, actor_id: u32) -> bool {
+        self.contains(x, y)
+            && *self.costs.get(x, y) != COST_IMPASSABLE
+            && (*self.occupancy.get(x, y) == 0 || *self.occupancy.get(x, y) == actor_id)
+    }
+
     /// Check if a cell is passable terrain (ignoring occupancy).
     pub fn is_terrain_passable(&self, x: i32, y: i32) -> bool {
         self.contains(x, y) && *self.costs.get(x, y) != COST_IMPASSABLE

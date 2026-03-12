@@ -11,6 +11,7 @@ use serde::Serialize;
 pub use crate::actor::ActorKind;
 
 use crate::actor::{Activity, Actor, HarvestState};
+use crate::gamerules::GameRules;
 use crate::math::{CPos, WPos};
 use crate::pathfinder;
 use crate::rng::MersenneTwister;
@@ -142,6 +143,10 @@ pub struct ActorSnapshot {
     pub owner: u32,
     pub x: i32,
     pub y: i32,
+    pub actor_type: String,
+    pub hp: i32,
+    pub max_hp: i32,
+    pub activity: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -197,6 +202,8 @@ pub struct World {
     /// Per-player shroud: 0=unexplored, 1=fogged, 2=visible.
     /// Index by player_actor_ids index.
     shroud: Vec<CellLayer<u8>>,
+    /// Compiled game rules for lookups (costs, stats, weapons).
+    pub rules: GameRules,
 }
 
 impl World {
@@ -286,7 +293,23 @@ impl World {
             }
             let owner = actor.owner_id.unwrap_or(0);
             let (x, y) = actor.location.unwrap_or((0, 0));
-            actors.push(ActorSnapshot { id: actor.id, kind: actor.kind, owner, x, y });
+            let actor_type_str = actor.actor_type.as_deref().unwrap_or("").to_string();
+            let hp = actor.traits.iter().find_map(|t| {
+                if let TraitState::Health { hp } = t { Some(*hp) } else { None }
+            }).unwrap_or(0);
+            let max_hp = self.rules.actor(&actor_type_str)
+                .map(|s| s.hp).unwrap_or(hp);
+            let activity = match &actor.activity {
+                None => "idle",
+                Some(Activity::Move { .. }) => "moving",
+                Some(Activity::Turn { .. }) => "turning",
+                Some(Activity::Attack { .. }) => "attacking",
+                Some(Activity::Harvest { .. }) => "harvesting",
+            }.to_string();
+            actors.push(ActorSnapshot {
+                id: actor.id, kind: actor.kind, owner, x, y,
+                actor_type: actor_type_str, hp, max_hp, activity,
+            });
         }
         let players = self.player_actor_ids.iter().map(|&pid| {
             let actor = self.actors.get(&pid);
@@ -431,7 +454,7 @@ impl World {
             }
             "StartProduction" => {
                 if let (Some(subject_id), Some(item_name)) = (order.subject_id, &order.target_string) {
-                    let cost = production_cost(item_name);
+                    let cost = self.rules.cost(item_name);
                     if cost > 0 {
                         // Check tech tree prerequisites
                         if !self.has_prerequisites(subject_id, item_name) {
@@ -570,7 +593,7 @@ impl World {
     fn estimate_building_sell_value(&self, actor_id: u32) -> i32 {
         if let Some(actor) = self.actors.get(&actor_id) {
             if let Some(ref at) = actor.actor_type {
-                return production_cost(at) / 2;
+                return self.rules.cost(at) / 2;
             }
         }
         500
@@ -599,20 +622,39 @@ impl World {
         }
     }
 
-    /// Handle an Attack order: set attack activity.
+    /// Handle an Attack order: set attack activity with weapon stats from rules.
     fn order_attack(&mut self, actor_id: u32, target_id: u32) {
-        // Default weapon range of 5 cells (will be from rules later)
+        // Look up attacker's primary weapon from rules
+        let weapon = self.actors.get(&actor_id)
+            .and_then(|a| a.actor_type.as_deref())
+            .and_then(|at| self.rules.actor(at))
+            .and_then(|stats| stats.weapons.first())
+            .and_then(|wname| self.rules.weapon(wname))
+            .or_else(|| self.rules.weapon("default"));
+
+        let (damage, range_cells, reload, burst) = match weapon {
+            Some(w) => (w.damage, w.range / 1024, w.reload_delay, w.burst),
+            None => (100, 5, 1, 1),
+        };
+
         if let Some(actor) = self.actors.get_mut(&actor_id) {
             actor.activity = Some(Activity::Attack {
                 target_id,
-                weapon_range: 5,
+                weapon_range: range_cells,
+                weapon_damage: damage,
+                reload_delay: reload,
+                reload_remaining: 0,
+                burst,
+                burst_remaining: burst,
             });
         }
     }
 
     /// Handle PlaceBuilding order: create building actor and occupy terrain.
     fn order_place_building(&mut self, owner_player_id: u32, building_type: &str, x: i32, y: i32) {
-        let (footprint_w, footprint_h, hp) = building_footprint(building_type);
+        let (footprint_w, footprint_h, hp) = self.rules.actor(building_type)
+            .map(|s| (s.footprint.0, s.footprint.1, s.hp))
+            .unwrap_or((2, 2, 50000));
         let building_id = self.next_actor_id;
         self.next_actor_id += 1;
 
@@ -635,7 +677,7 @@ impl World {
         self.terrain.occupy_footprint(x, y, footprint_w, footprint_h, building_id);
 
         // Update power for the owning player
-        let power = building_power(building_type);
+        let power = self.rules.actor(building_type).map(|s| s.power).unwrap_or(0);
         if power != 0 {
             self.update_player_power(owner_player_id, power);
         }
@@ -1041,10 +1083,16 @@ impl World {
     /// Get movement speed for an actor (world units per tick).
     fn actor_speed(&self, actor_id: u32) -> i32 {
         if let Some(actor) = self.actors.get(&actor_id) {
+            if let Some(ref at) = actor.actor_type {
+                if let Some(stats) = self.rules.actor(at) {
+                    return stats.speed;
+                }
+            }
+            // Fallback by kind
             match actor.kind {
-                ActorKind::Infantry => 43,   // ~24 ticks/cell
-                ActorKind::Vehicle => 85,    // ~12 ticks/cell
-                ActorKind::Mcv => 56,        // ~18 ticks/cell
+                ActorKind::Infantry => 43,
+                ActorKind::Vehicle => 85,
+                ActorKind::Mcv => 56,
                 _ => 56,
             }
         } else {
@@ -1119,6 +1167,7 @@ impl World {
 
         // Tick Move activities: advance position along path.
         let mut move_completions: Vec<u32> = Vec::new();
+        let mut occupancy_updates: Vec<(u32, (i32, i32), (i32, i32))> = Vec::new(); // (id, from, to)
         for actor in self.actors.values_mut() {
             if let Some(Activity::Move { ref path, ref mut path_index, speed }) = actor.activity {
                 if *path_index >= path.len() {
@@ -1171,6 +1220,10 @@ impl World {
                 }
 
                 if arrived {
+                    let old_loc = actor.location.unwrap_or(target_cell);
+                    if old_loc != target_cell {
+                        occupancy_updates.push((actor.id, old_loc, target_cell));
+                    }
                     actor.location = Some(target_cell);
                     *path_index += 1;
                     if *path_index >= path.len() {
@@ -1179,6 +1232,11 @@ impl World {
                 }
             }
         }
+        // Update terrain occupancy for moved units
+        for (actor_id, from, to) in occupancy_updates {
+            self.terrain.clear_occupant(from.0, from.1);
+            self.terrain.set_occupant(to.0, to.1, actor_id);
+        }
         // Clear completed Move activities
         for id in move_completions {
             if let Some(actor) = self.actors.get_mut(&id) {
@@ -1186,20 +1244,43 @@ impl World {
             }
         }
 
-        // Tick Attack activities: check range, deal damage.
-        let mut attacks: Vec<(u32, u32, i32)> = Vec::new(); // (attacker, target, damage)
-        for actor in self.actors.values() {
-            if let Some(Activity::Attack { target_id, weapon_range }) = &actor.activity {
-                if let (Some(attacker_loc), Some(target)) =
-                    (actor.location, self.actors.get(target_id))
-                {
-                    if let Some(target_loc) = target.location {
-                        let dx = (attacker_loc.0 - target_loc.0).abs();
-                        let dy = (attacker_loc.1 - target_loc.1).abs();
-                        let dist = dx.max(dy);
-                        if dist <= *weapon_range {
-                            // In range — deal damage (simplified: 100 HP per tick)
-                            attacks.push((actor.id, *target_id, 100));
+        // Tick Attack activities: check range, manage reload, deal damage.
+        // First pass: decrement reload timers and collect ready-to-fire attackers
+        let mut ready_attackers: Vec<(u32, u32, i32, i32)> = Vec::new(); // (attacker_id, target_id, damage, weapon_range)
+        for actor in self.actors.values_mut() {
+            if let Some(Activity::Attack {
+                target_id, weapon_range, weapon_damage,
+                ref mut reload_remaining, ..
+            }) = actor.activity {
+                if *reload_remaining > 0 {
+                    *reload_remaining -= 1;
+                } else {
+                    ready_attackers.push((actor.id, target_id, weapon_damage, weapon_range));
+                }
+            }
+        }
+        // Second pass: check range and fire
+        let mut attacks: Vec<(u32, u32, i32)> = Vec::new();
+        for (attacker_id, target_id, damage, weapon_range) in ready_attackers {
+            let attacker_loc = self.actors.get(&attacker_id).and_then(|a| a.location);
+            let target_loc = self.actors.get(&target_id).and_then(|a| a.location);
+            if let (Some(aloc), Some(tloc)) = (attacker_loc, target_loc) {
+                let dx = (aloc.0 - tloc.0).abs();
+                let dy = (aloc.1 - tloc.1).abs();
+                let dist = dx.max(dy);
+                if dist <= weapon_range {
+                    attacks.push((attacker_id, target_id, damage));
+                    // Update burst/reload state
+                    if let Some(actor) = self.actors.get_mut(&attacker_id) {
+                        if let Some(Activity::Attack {
+                            ref mut burst_remaining, burst,
+                            ref mut reload_remaining, reload_delay, ..
+                        }) = actor.activity {
+                            *burst_remaining -= 1;
+                            if *burst_remaining <= 0 {
+                                *burst_remaining = burst;
+                                *reload_remaining = reload_delay;
+                            }
                         }
                     }
                 }
@@ -1236,6 +1317,18 @@ impl World {
         let player_ids: Vec<u32> = self.production.keys().copied().collect();
         let mut completed_items: Vec<(u32, String)> = Vec::new();
         for pid in player_ids {
+            // Low-power slowdown: skip every other tick if power_drained > power_provided
+            let is_low_power = self.actors.get(&pid).map(|a| {
+                for t in &a.traits {
+                    if let TraitState::PowerManager { power_provided, power_drained } = t {
+                        return *power_drained > *power_provided && *power_provided > 0;
+                    }
+                }
+                false
+            }).unwrap_or(false);
+            if is_low_power && self.world_tick % 2 == 0 {
+                continue; // 50% production speed when low power
+            }
             let cash = self.actors.get(&pid).map(|a| a.cash()).unwrap_or(0);
             if let Some(items) = self.production.get_mut(&pid) {
                 if let Some(item) = items.first_mut() {
@@ -1256,7 +1349,7 @@ impl World {
         }
         // Spawn completed units
         for (owner_pid, unit_type) in completed_items {
-            if is_unit_type(&unit_type) {
+            if self.rules.is_unit(&unit_type) {
                 self.frame_end_tasks.push(FrameEndTask::SpawnUnit {
                     unit_type,
                     owner_player_id: owner_pid,
@@ -1302,7 +1395,9 @@ impl World {
         let unit_id = self.next_actor_id;
         self.next_actor_id += 1;
 
-        let (kind, speed, hp) = unit_stats(unit_type);
+        let (kind, speed, hp) = self.rules.actor(unit_type)
+            .map(|s| (s.kind, s.speed, s.hp))
+            .unwrap_or((ActorKind::Vehicle, 71, 100000));
         let facing = 512; // Default facing south
         let cell = CPos::new(x, y);
         let center = center_of_cell(x, y);
@@ -1343,6 +1438,7 @@ impl World {
             actor_type: Some(unit_type.to_string()),
         };
         self.actors.insert(unit_id, actor);
+        self.terrain.set_occupant(x, y, unit_id);
         eprintln!("SPAWN: {} id={} at ({},{}) owner={} speed={} hp={}",
             unit_type, unit_id, x, y, owner_player_id, speed, hp);
     }
@@ -1362,16 +1458,19 @@ impl World {
 
     /// Check if a player has the required prerequisite buildings for an item.
     fn has_prerequisites(&self, owner_player_id: u32, item_name: &str) -> bool {
-        let prereqs = production_prerequisites(item_name);
+        let prereqs = match self.rules.actor(item_name) {
+            Some(stats) => &stats.prerequisites,
+            None => return true,
+        };
         if prereqs.is_empty() {
             return true;
         }
         // Check that the player owns at least one of each prerequisite building type
-        for &prereq in prereqs {
+        for prereq in prereqs {
             let has_it = self.actors.values().any(|a| {
                 a.owner_id == Some(owner_player_id)
                     && a.kind == ActorKind::Building
-                    && a.actor_type.as_deref() == Some(prereq)
+                    && a.actor_type.as_deref() == Some(prereq.as_str())
             });
             if !has_it {
                 return false;
@@ -1382,8 +1481,9 @@ impl World {
 
     /// Find a spawn location near a production building for the given owner.
     fn find_spawn_location(&self, owner_player_id: u32, unit_type: &str) -> Option<(i32, i32)> {
-        let is_infantry = matches!(unit_type, "e1" | "e2" | "e3" | "e4" | "e6" | "e7" | "shok"
-            | "medi" | "mech" | "dog" | "spy" | "thf" | "hijacker");
+        let is_infantry = self.rules.actor(unit_type)
+            .map(|s| s.kind == ActorKind::Infantry)
+            .unwrap_or(false);
 
         // Find production building for this unit type
         for actor in self.actors.values() {
@@ -1399,7 +1499,9 @@ impl World {
 
             if is_right_building {
                 if let Some((bx, by)) = actor.location {
-                    let (fw, fh, _) = building_footprint(btype);
+                    let (fw, fh) = self.rules.actor(btype)
+                        .map(|s| s.footprint)
+                        .unwrap_or((2, 2));
                     for dy in -1..=fh {
                         for dx in -1..=fw {
                             let sx = bx + dx;
@@ -1548,167 +1650,12 @@ fn parse_cell_target(s: &str) -> Option<(i32, i32)> {
     Some((x, y))
 }
 
-/// Get building footprint dimensions and HP for known building types.
-/// Returns (width, height, hp).
-fn building_footprint(building_type: &str) -> (i32, i32, i32) {
-    match building_type {
-        "powr" => (2, 2, 40000),
-        "apwr" => (2, 2, 70000),
-        "tent" | "barr" => (2, 2, 50000),
-        "weap" | "weap.ukraine" => (3, 2, 100000),
-        "proc" => (3, 2, 90000),
-        "fact" => (3, 2, 150000),
-        "fix" => (3, 2, 80000),
-        "dome" => (2, 2, 60000),
-        "hpad" | "afld" => (2, 2, 80000),
-        "spen" | "syrd" => (3, 3, 120000),
-        "atek" | "stek" => (2, 2, 60000),
-        "pbox" | "hbox" | "gun" | "ftur" | "tsla" | "agun" | "sam" | "gap" => (1, 1, 40000),
-        _ => (2, 2, 50000), // Default
-    }
-}
-
-/// Get power amount for a building type.
-/// Positive = provides power, negative = drains power.
-fn building_power(building_type: &str) -> i32 {
-    match building_type {
-        "powr" => 100,
-        "apwr" => 200,
-        // Consumers
-        "tsla" => -200,
-        "dome" => -200,
-        "mslo" => -150,
-        "sam" => -80,
-        "gap" => -60,
-        "atek" | "stek" => -50,
-        "agun" => -20,
-        // Most buildings don't consume power
-        _ => 0,
-    }
-}
-
 /// Resource value: cash per unit harvested.
 fn resource_value(rt: ResourceType) -> i32 {
     match rt {
         ResourceType::Ore => 25,
         ResourceType::Gems => 75,
         ResourceType::None => 0,
-    }
-}
-
-/// Get production cost for any buildable item.
-fn production_cost(name: &str) -> i32 {
-    match name {
-        // Buildings
-        "powr" => 300, "apwr" => 500,
-        "tent" | "barr" => 400,
-        "weap" | "weap.ukraine" => 2000,
-        "proc" => 1400, "fix" => 1200,
-        "dome" | "atek" | "stek" => 2800,
-        "hpad" | "afld" => 500,
-        "spen" | "syrd" => 650,
-        "pbox" => 400, "hbox" => 600, "gun" => 600,
-        "ftur" => 600, "tsla" => 1500, "agun" => 600,
-        "sam" => 750, "gap" => 500,
-        // Infantry
-        "e1" => 100, "e2" => 160, "e3" => 300, "e4" => 200,
-        "e6" => 500, "e7" => 600, "shok" => 400,
-        "medi" => 600, "mech" => 500,
-        "dog" => 200, "spy" => 500, "thf" => 500,
-        // Vehicles
-        "1tnk" => 700, "2tnk" => 800, "3tnk" => 1500, "4tnk" => 1800,
-        "v2rl" => 700, "arty" => 600, "harv" => 1400,
-        "mcv" => 2500, "apc" => 800, "jeep" => 600,
-        "mnly" => 500, "ttnk" => 1500, "ctnk" => 2000,
-        // Aircraft
-        "heli" => 1200, "hind" => 1200, "mig" => 2000, "yak" => 800,
-        // Naval
-        "ss" => 950, "msub" => 1800, "sub" => 950,
-        "dd" => 1000, "ca" => 2000, "pt" => 700,
-        _ => {
-            eprintln!("PRODUCTION: unknown item cost for '{}'", name);
-            0
-        }
-    }
-}
-
-/// Get required prerequisite buildings for a producible item.
-/// Returns a list of building type strings that must exist for the owner.
-fn production_prerequisites(name: &str) -> &'static [&'static str] {
-    match name {
-        // Infantry — need barracks/tent
-        "e1" | "e2" | "e3" | "e4" | "dog" => &[],  // Basic infantry, just need barracks
-        "e6" | "e7" | "shok" => &["stek"],           // Advanced soviet infantry
-        "medi" | "mech" => &["fix"],                  // Medic/mechanic need service depot
-        "spy" | "thf" => &["atek"],                   // Spy/thief need tech center
-        // Vehicles — need war factory
-        "1tnk" | "2tnk" | "apc" | "jeep" | "mnly" | "harv" | "mcv" => &[],  // Basic vehicles
-        "3tnk" | "4tnk" | "v2rl" => &["stek"],       // Advanced soviet vehicles
-        "arty" => &[],                                 // Artillery
-        "ttnk" => &["atek"],                          // Tesla tank needs tech
-        "ctnk" => &["atek"],                          // Chrono tank needs tech
-        // Buildings
-        "powr" | "apwr" => &[],                       // Power plants
-        "tent" | "barr" => &["powr"],                 // Barracks need power
-        "weap" | "weap.ukraine" => &["powr"],         // War factory needs power
-        "proc" => &["powr"],                          // Refinery needs power
-        "dome" => &["powr"],                          // Radar dome
-        "fix" => &["weap"],                           // Service depot needs factory
-        "atek" => &["dome"],                          // Allied tech needs radar
-        "stek" => &["dome"],                          // Soviet tech needs radar
-        "hpad" | "afld" => &["dome"],                 // Airfield needs radar
-        "spen" | "syrd" => &["weap"],                 // Naval yard needs factory
-        // Defenses
-        "pbox" | "hbox" => &[],                       // Basic defense
-        "gun" | "ftur" => &["powr"],                  // Gun turret
-        "tsla" => &["stek"],                          // Tesla coil needs tech
-        "agun" | "sam" => &["dome"],                  // AA needs radar
-        "gap" => &["atek"],                           // Gap generator needs tech
-        _ => &[],
-    }
-}
-
-/// Check if an item name is a unit (vs building).
-fn is_unit_type(name: &str) -> bool {
-    matches!(name,
-        "e1" | "e2" | "e3" | "e4" | "e6" | "e7" | "shok" | "medi" | "mech" | "dog" |
-        "spy" | "thf" | "hijacker" |
-        "1tnk" | "2tnk" | "3tnk" | "4tnk" | "v2rl" | "arty" | "harv" | "mcv" | "mnly" |
-        "apc" | "truk" | "jeep" | "ttnk" | "ctnk" | "qtnk" | "stnk" | "dtrk" |
-        "heli" | "hind" | "mig" | "yak" | "tran" |
-        "ss" | "msub" | "sub" | "dd" | "ca" | "pt" | "lst"
-    )
-}
-
-/// Get unit stats: (kind, speed, hp).
-fn unit_stats(unit_type: &str) -> (ActorKind, i32, i32) {
-    match unit_type {
-        // Infantry
-        "e1" => (ActorKind::Infantry, 43, 50000),
-        "e2" => (ActorKind::Infantry, 43, 50000),
-        "e3" => (ActorKind::Infantry, 43, 45000),
-        "e4" => (ActorKind::Infantry, 43, 60000),
-        "e6" => (ActorKind::Infantry, 43, 25000),
-        "e7" => (ActorKind::Infantry, 43, 100000),
-        "shok" => (ActorKind::Infantry, 43, 80000),
-        "medi" => (ActorKind::Infantry, 43, 80000),
-        "mech" => (ActorKind::Infantry, 43, 70000),
-        "dog" => (ActorKind::Infantry, 85, 20000),
-        "spy" => (ActorKind::Infantry, 56, 25000),
-        "thf" => (ActorKind::Infantry, 56, 50000),
-        // Vehicles
-        "1tnk" => (ActorKind::Vehicle, 113, 160000),
-        "2tnk" => (ActorKind::Vehicle, 85, 260000),
-        "3tnk" => (ActorKind::Vehicle, 71, 400000),
-        "4tnk" => (ActorKind::Vehicle, 56, 500000),
-        "v2rl" => (ActorKind::Vehicle, 71, 150000),
-        "arty" => (ActorKind::Vehicle, 85, 75000),
-        "harv" => (ActorKind::Vehicle, 56, 60000),
-        "mcv" => (ActorKind::Vehicle, 56, 60000),
-        "apc" => (ActorKind::Vehicle, 113, 200000),
-        "jeep" => (ActorKind::Vehicle, 113, 150000),
-        "mnly" => (ActorKind::Vehicle, 85, 55000),
-        _ => (ActorKind::Vehicle, 71, 100000), // Default
     }
 }
 
@@ -2028,6 +1975,7 @@ pub fn build_world(
         map_width: map.map_size.0,
         map_height: map.map_size.1,
         shroud,
+        rules: GameRules::defaults(),
     };
 
     // Initial shroud reveal around starting units

@@ -36,7 +36,12 @@ pub enum Activity {
     /// Attack a target actor. Move in range, then fire.
     Attack {
         target_id: u32,
-        weapon_range: i32, // cells
+        weapon_range: i32,     // cells
+        weapon_damage: i32,    // base damage per shot
+        reload_delay: i32,     // ticks between shots
+        reload_remaining: i32, // ticks until next shot
+        burst: i32,            // shots per reload cycle
+        burst_remaining: i32,  // shots left in current burst
     },
     /// Harvest resources: find ore → move → harvest → deliver → repeat.
     Harvest {

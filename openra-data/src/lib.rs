@@ -8,4 +8,6 @@
 pub mod miniyaml;
 pub mod oramap;
 pub mod orarep;
+pub mod palette;
 pub mod rules;
+pub mod shp;
