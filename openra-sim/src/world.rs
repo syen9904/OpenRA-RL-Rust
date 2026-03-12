@@ -54,6 +54,7 @@ pub struct GameOrder {
 /// A production item being built in a ClassicProductionQueue.
 #[derive(Debug)]
 struct ProductionItem {
+    item_name: String,
     total_cost: i32,
     total_time: i32,
     remaining_cost: i32,
@@ -62,9 +63,10 @@ struct ProductionItem {
 }
 
 impl ProductionItem {
-    fn new(cost: i32, build_duration_modifier: i32) -> Self {
+    fn new(name: &str, cost: i32, build_duration_modifier: i32) -> Self {
         let time = (cost as i64 * build_duration_modifier as i64 / 100) as i32;
         ProductionItem {
+            item_name: name.to_string(),
             total_cost: cost,
             total_time: time,
             remaining_cost: cost,
@@ -110,6 +112,7 @@ impl ProductionItem {
 #[derive(Debug)]
 enum FrameEndTask {
     DeployTransform { old_actor_id: u32, location: (i32, i32), owner_player_id: u32 },
+    SpawnUnit { unit_type: String, owner_player_id: u32 },
 }
 
 // === Snapshot types for rendering ===
@@ -345,24 +348,10 @@ impl World {
             }
             "StartProduction" => {
                 if let (Some(subject_id), Some(item_name)) = (order.subject_id, &order.target_string) {
-                    let cost = match item_name.as_str() {
-                        "powr" => 300,
-                        "apwr" => 500,
-                        "tent" | "barr" => 400,
-                        "weap" | "weap.ukraine" => 2000,
-                        "proc" => 1400,
-                        "fix" => 1200,
-                        "dome" | "atek" | "stek" => 2800,
-                        "hpad" | "afld" => 500,
-                        "spen" | "syrd" => 650,
-                        _ => {
-                            eprintln!("ORDER: StartProduction unknown item '{}' subject={}", item_name, subject_id);
-                            0
-                        }
-                    };
+                    let cost = production_cost(item_name);
                     if cost > 0 {
                         eprintln!("ORDER: StartProduction subject={} item={} cost={}", subject_id, item_name, cost);
-                        let item = ProductionItem::new(cost, 60);
+                        let item = ProductionItem::new(item_name, cost, 60);
                         self.production.entry(subject_id).or_default().push(item);
                     }
                 }
@@ -671,6 +660,7 @@ impl World {
 
         // Tick production queues: consume cash, advance build time.
         let player_ids: Vec<u32> = self.production.keys().copied().collect();
+        let mut completed_items: Vec<(u32, String)> = Vec::new();
         for pid in player_ids {
             let cash = self.actors.get(&pid).map(|a| a.cash()).unwrap_or(0);
             if let Some(items) = self.production.get_mut(&pid) {
@@ -682,11 +672,23 @@ impl World {
                         }
                     }
                     if item.is_done() {
+                        let name = item.item_name.clone();
                         items.remove(0);
-                        eprintln!("PRODUCTION: item complete for player {}", pid);
+                        eprintln!("PRODUCTION: {} complete for player {}", name, pid);
+                        completed_items.push((pid, name));
                     }
                 }
             }
+        }
+        // Spawn completed units
+        for (owner_pid, unit_type) in completed_items {
+            if is_unit_type(&unit_type) {
+                self.frame_end_tasks.push(FrameEndTask::SpawnUnit {
+                    unit_type,
+                    owner_player_id: owner_pid,
+                });
+            }
+            // Buildings wait for PlaceBuilding order
         }
 
         // Queue deploy for MCVs that finished turning
@@ -707,8 +709,85 @@ impl World {
                 FrameEndTask::DeployTransform { old_actor_id, location, owner_player_id } => {
                     self.deploy_transform(old_actor_id, location, owner_player_id);
                 }
+                FrameEndTask::SpawnUnit { unit_type, owner_player_id } => {
+                    self.spawn_unit(&unit_type, owner_player_id);
+                }
             }
         }
+    }
+
+    /// Spawn a unit near the owner's production building (WEAP for vehicles, TENT/BARR for infantry).
+    fn spawn_unit(&mut self, unit_type: &str, owner_player_id: u32) {
+        // Find a building owned by this player to spawn near
+        let spawn_loc = self.find_spawn_location(owner_player_id, unit_type);
+        let (x, y) = match spawn_loc {
+            Some(loc) => loc,
+            None => return, // No production building found
+        };
+
+        let unit_id = self.next_actor_id;
+        self.next_actor_id += 1;
+
+        let (kind, speed, hp) = unit_stats(unit_type);
+        let facing = 512; // Default facing south
+        let cell = CPos::new(x, y);
+        let center = center_of_cell(x, y);
+
+        let actor = Actor {
+            id: unit_id,
+            kind,
+            owner_id: Some(owner_player_id),
+            location: Some((x, y)),
+            traits: vec![
+                TraitState::BodyOrientation { quantized_facings: 32 },
+                TraitState::Mobile {
+                    facing, from_cell: cell, to_cell: cell,
+                    center_position: center,
+                },
+                TraitState::Health { hp },
+            ],
+            activity: None,
+        };
+        self.actors.insert(unit_id, actor);
+        eprintln!("SPAWN: {} id={} at ({},{}) owner={} speed={} hp={}",
+            unit_type, unit_id, x, y, owner_player_id, speed, hp);
+    }
+
+    /// Find a spawn location near a production building for the given owner.
+    fn find_spawn_location(&self, owner_player_id: u32, unit_type: &str) -> Option<(i32, i32)> {
+        let is_infantry = matches!(unit_type, "e1" | "e2" | "e3" | "e4" | "e6" | "e7" | "shok"
+            | "medi" | "mech" | "dog" | "spy" | "thf" | "hijacker");
+
+        // Find production building for this unit type
+        for actor in self.actors.values() {
+            if actor.owner_id != Some(owner_player_id) { continue; }
+            if actor.kind != ActorKind::Building { continue; }
+
+            if let Some((bx, by)) = actor.location {
+                // Check if this is the right production building
+                let is_right_building = if is_infantry {
+                    // TENT (allies) or BARR (soviet) produce infantry
+                    true // Simplified: any building can produce for now
+                } else {
+                    true // WEAP produces vehicles
+                };
+
+                if is_right_building {
+                    // Find an empty adjacent cell for spawning
+                    let (fw, fh) = (3, 2); // Approximate footprint
+                    for dy in -1..=fh {
+                        for dx in -1..=fw {
+                            let sx = bx + dx;
+                            let sy = by + dy;
+                            if self.terrain.is_passable(sx, sy) {
+                                return Some((sx, sy));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Deploy an MCV: remove it and create a Construction Yard.
@@ -860,6 +939,86 @@ fn building_footprint(building_type: &str) -> (i32, i32, i32) {
         "atek" | "stek" => (2, 2, 60000),
         "pbox" | "hbox" | "gun" | "ftur" | "tsla" | "agun" | "sam" | "gap" => (1, 1, 40000),
         _ => (2, 2, 50000), // Default
+    }
+}
+
+/// Get production cost for any buildable item.
+fn production_cost(name: &str) -> i32 {
+    match name {
+        // Buildings
+        "powr" => 300, "apwr" => 500,
+        "tent" | "barr" => 400,
+        "weap" | "weap.ukraine" => 2000,
+        "proc" => 1400, "fix" => 1200,
+        "dome" | "atek" | "stek" => 2800,
+        "hpad" | "afld" => 500,
+        "spen" | "syrd" => 650,
+        "pbox" => 400, "hbox" => 600, "gun" => 600,
+        "ftur" => 600, "tsla" => 1500, "agun" => 600,
+        "sam" => 750, "gap" => 500,
+        // Infantry
+        "e1" => 100, "e2" => 160, "e3" => 300, "e4" => 200,
+        "e6" => 500, "e7" => 600, "shok" => 400,
+        "medi" => 600, "mech" => 500,
+        "dog" => 200, "spy" => 500, "thf" => 500,
+        // Vehicles
+        "1tnk" => 700, "2tnk" => 800, "3tnk" => 1500, "4tnk" => 1800,
+        "v2rl" => 700, "arty" => 600, "harv" => 1400,
+        "mcv" => 2500, "apc" => 800, "jeep" => 600,
+        "mnly" => 500, "ttnk" => 1500, "ctnk" => 2000,
+        // Aircraft
+        "heli" => 1200, "hind" => 1200, "mig" => 2000, "yak" => 800,
+        // Naval
+        "ss" => 950, "msub" => 1800, "sub" => 950,
+        "dd" => 1000, "ca" => 2000, "pt" => 700,
+        _ => {
+            eprintln!("PRODUCTION: unknown item cost for '{}'", name);
+            0
+        }
+    }
+}
+
+/// Check if an item name is a unit (vs building).
+fn is_unit_type(name: &str) -> bool {
+    matches!(name,
+        "e1" | "e2" | "e3" | "e4" | "e6" | "e7" | "shok" | "medi" | "mech" | "dog" |
+        "spy" | "thf" | "hijacker" |
+        "1tnk" | "2tnk" | "3tnk" | "4tnk" | "v2rl" | "arty" | "harv" | "mcv" | "mnly" |
+        "apc" | "truk" | "jeep" | "ttnk" | "ctnk" | "qtnk" | "stnk" | "dtrk" |
+        "heli" | "hind" | "mig" | "yak" | "tran" |
+        "ss" | "msub" | "sub" | "dd" | "ca" | "pt" | "lst"
+    )
+}
+
+/// Get unit stats: (kind, speed, hp).
+fn unit_stats(unit_type: &str) -> (ActorKind, i32, i32) {
+    match unit_type {
+        // Infantry
+        "e1" => (ActorKind::Infantry, 43, 50000),
+        "e2" => (ActorKind::Infantry, 43, 50000),
+        "e3" => (ActorKind::Infantry, 43, 45000),
+        "e4" => (ActorKind::Infantry, 43, 60000),
+        "e6" => (ActorKind::Infantry, 43, 25000),
+        "e7" => (ActorKind::Infantry, 43, 100000),
+        "shok" => (ActorKind::Infantry, 43, 80000),
+        "medi" => (ActorKind::Infantry, 43, 80000),
+        "mech" => (ActorKind::Infantry, 43, 70000),
+        "dog" => (ActorKind::Infantry, 85, 20000),
+        "spy" => (ActorKind::Infantry, 56, 25000),
+        "thf" => (ActorKind::Infantry, 56, 50000),
+        // Vehicles
+        "1tnk" => (ActorKind::Vehicle, 113, 160000),
+        "2tnk" => (ActorKind::Vehicle, 85, 260000),
+        "3tnk" => (ActorKind::Vehicle, 71, 400000),
+        "4tnk" => (ActorKind::Vehicle, 56, 500000),
+        "v2rl" => (ActorKind::Vehicle, 71, 150000),
+        "arty" => (ActorKind::Vehicle, 85, 75000),
+        "harv" => (ActorKind::Vehicle, 56, 60000),
+        "mcv" => (ActorKind::Vehicle, 56, 60000),
+        "apc" => (ActorKind::Vehicle, 113, 200000),
+        "jeep" => (ActorKind::Vehicle, 113, 150000),
+        "mnly" => (ActorKind::Vehicle, 85, 55000),
+        _ => (ActorKind::Vehicle, 71, 100000), // Default
     }
 }
 
