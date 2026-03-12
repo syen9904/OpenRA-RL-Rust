@@ -4,41 +4,23 @@
 //! then computes per-tick SyncHash to verify determinism against
 //! the hashes recorded in .orarep files.
 
+use std::collections::{BTreeMap, HashMap};
+
+use serde::Serialize;
+
+pub use crate::actor::ActorKind;
+
+use crate::actor::{Activity, Actor};
 use crate::math::{CPos, WPos};
 use crate::rng::MersenneTwister;
 use crate::sync;
-use serde::Serialize;
-use std::collections::HashMap;
-
-/// Bool hash values matching C# Sync.cs EmitSyncOpcodes:
-///
-/// Due to an IL generation quirk in OpenRA's Sync.cs, the Brtrue instruction
-/// always pops the pushed 0xaaa constant (which is always truthy), leaving
-/// the raw bool value (0 or 1) on the stack for XOR. So:
-/// true → 1, false → 0 (NOT 0xaaa/0x555 as the code appears to intend).
-fn hash_bool(b: bool) -> i32 {
-    if b { 1 } else { 0 }
-}
-
-/// Compute the XOR hash of N bool fields.
-fn xor_bools(values: &[bool]) -> i32 {
-    let mut h = 0i32;
-    for &v in values {
-        h ^= hash_bool(v);
-    }
-    h
-}
+use crate::traits::{PqType, TraitState};
 
 /// Lobby information extracted from the replay's SyncInfo orders.
-/// This is needed to determine player count, starting cash, slots, etc.
 #[derive(Debug, Clone)]
 pub struct LobbyInfo {
-    /// Starting cash for all players
     pub starting_cash: i32,
-    /// Whether spectators are allowed (determines "Everyone" player creation)
     pub allow_spectators: bool,
-    /// Slot definitions in order (e.g., ["Multi0", "Multi1"])
-    /// Only slots with a client assigned are included.
     pub occupied_slots: Vec<SlotInfo>,
 }
 
@@ -67,114 +49,6 @@ pub struct GameOrder {
     pub extra_data: Option<u32>,
 }
 
-/// Actor kind for rendering purposes.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-pub enum ActorKind {
-    World,
-    Player,
-    Tree,
-    Mine,
-    Spawn,
-    Mcv,
-    Building,
-}
-
-/// Snapshot of the world state for rendering.
-#[derive(Debug, Serialize)]
-pub struct WorldSnapshot {
-    pub tick: u32,
-    pub actors: Vec<ActorSnapshot>,
-    pub players: Vec<PlayerSnapshot>,
-    pub map_width: i32,
-    pub map_height: i32,
-}
-
-/// Snapshot of a single actor.
-#[derive(Debug, Serialize)]
-pub struct ActorSnapshot {
-    pub id: u32,
-    pub kind: ActorKind,
-    pub owner: u32,
-    pub x: i32,
-    pub y: i32,
-}
-
-/// Snapshot of a player.
-#[derive(Debug, Serialize)]
-pub struct PlayerSnapshot {
-    pub index: u32,
-    pub cash: i32,
-}
-
-/// The game world state.
-pub struct World {
-    /// All actors in creation order (ActorID order).
-    all_actor_ids: Vec<u32>,
-    /// Actors with ISync traits, in ActorID order.
-    sync_actors: Vec<sync::ActorSync>,
-    /// Synced effects (projectiles etc.) — empty at tick 0.
-    synced_effects: Vec<i32>,
-    /// The shared RNG.
-    pub rng: MersenneTwister,
-    /// Player actor IDs with UnlockedRenderPlayer = true.
-    unlocked_render_player_ids: Vec<u32>,
-    /// Whether the world simulation is paused.
-    pub paused: bool,
-    /// Current simulation tick (incremented each unpaused frame).
-    pub world_tick: u32,
-    /// Current frame number (incremented every process_frame call).
-    pub frame_number: u32,
-    /// Network order latency (empty frames before game starts). Default=15.
-    pub order_latency: u32,
-    /// Next actor ID to assign when creating actors.
-    next_actor_id: u32,
-    /// Pending frame-end tasks (actor removals/creations from Transform, etc.)
-    frame_end_tasks: Vec<FrameEndTask>,
-    /// Actor cell locations (actor_id → (x, y)) for position lookups.
-    actor_locations: HashMap<u32, (i32, i32)>,
-    /// Player actor IDs (for PQ state updates, etc.)
-    player_actor_ids: Vec<u32>,
-    /// PQ trait indices within each player's sync trait list (offsets 6-11).
-    /// Used to update PQ Enabled hash on first tick.
-    pq_enabled: bool,
-    /// MCV actors: tracking facing and turn state for deployment.
-    mcv_states: Vec<McvState>,
-    /// Actor ID of the "Everyone" spectator player (always sees everything).
-    everyone_player_id: u32,
-    /// FrozenActorLayer state per player: (FrozenHash, VisibilityHash).
-    /// Tracked separately so we can compute FH ^ VH correctly.
-    fal_state: HashMap<u32, (i32, i32)>,
-    /// Number of MINE actors on the map (for SeedsResource RNG consumption).
-    mine_count: usize,
-    /// Ticks until next SeedsResource seeding event.
-    seeds_resource_ticks: i32,
-    /// Active production items per player actor ID.
-    production: HashMap<u32, Vec<ProductionItem>>,
-    /// Current cash per player actor ID (for production consumption).
-    player_cash: HashMap<u32, i32>,
-    /// Actor kind by ID (for rendering snapshots).
-    actor_kinds: HashMap<u32, ActorKind>,
-    /// Actor owner player ID by actor ID.
-    actor_owners: HashMap<u32, u32>,
-    /// Map dimensions (cells).
-    map_width: i32,
-    map_height: i32,
-}
-
-/// Mutable state for an MCV actor during deployment.
-#[derive(Debug)]
-struct McvState {
-    actor_id: u32,
-    facing: i32,        // Current WAngle facing (0-1023)
-    turn_target: i32,   // Target facing for deployment (384)
-    is_turning: bool,   // Whether actively turning toward deploy facing
-    turn_done: bool,    // Facing reached target; deploy on NEXT tick (C# Turn returns false after TickFacing)
-    turn_speed: i32,    // WAngle units per tick (empirically 60)
-    spawn_x: i32,
-    spawn_y: i32,
-    owner_player_id: u32,
-}
-
 /// A production item being built in a ClassicProductionQueue.
 #[derive(Debug)]
 struct ProductionItem {
@@ -187,9 +61,6 @@ struct ProductionItem {
 
 impl ProductionItem {
     fn new(cost: i32, build_duration_modifier: i32) -> Self {
-        // C# GetBuildTime: time = cost, then apply BuildableInfo.BuildDurationModifier (60%)
-        // and ProductionQueueInfo.BuildDurationModifier (100%).
-        // ApplyPercentageModifiers: time * mod / 100 for each modifier.
         let time = (cost as i64 * build_duration_modifier as i64 / 100) as i32;
         ProductionItem {
             total_cost: cost,
@@ -200,17 +71,13 @@ impl ProductionItem {
         }
     }
 
-    /// Tick the production item, consuming cash. Returns cash consumed this tick.
     fn tick(&mut self, cash: i32) -> i32 {
         if !self.started {
-            // First tick recalculates time (we already have it right)
             self.started = true;
         }
-
         if self.remaining_time <= 0 {
             return 0;
         }
-
         if self.remaining_cost != 0 {
             let expected_remaining_cost = if self.remaining_time == 1 {
                 0
@@ -221,14 +88,13 @@ impl ProductionItem {
             let cost_this_tick = self.remaining_cost - expected_remaining_cost;
             if cost_this_tick != 0 {
                 if cash < cost_this_tick {
-                    return 0; // Can't afford, stall
+                    return 0;
                 }
                 self.remaining_cost -= cost_this_tick;
                 self.remaining_time -= 1;
                 return cost_this_tick;
             }
         }
-
         self.remaining_time -= 1;
         0
     }
@@ -241,54 +107,129 @@ impl ProductionItem {
 /// A deferred action to execute at the end of World.Tick().
 #[derive(Debug)]
 enum FrameEndTask {
-    /// Deploy an MCV into a Construction Yard.
     DeployTransform { old_actor_id: u32, location: (i32, i32), owner_player_id: u32 },
+}
+
+// === Snapshot types for rendering ===
+
+#[derive(Debug, Serialize)]
+pub struct WorldSnapshot {
+    pub tick: u32,
+    pub actors: Vec<ActorSnapshot>,
+    pub players: Vec<PlayerSnapshot>,
+    pub map_width: i32,
+    pub map_height: i32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ActorSnapshot {
+    pub id: u32,
+    pub kind: ActorKind,
+    pub owner: u32,
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlayerSnapshot {
+    pub index: u32,
+    pub cash: i32,
+}
+
+pub struct SyncHashDebug {
+    pub full: i32,
+    pub identity: i32,
+    pub traits: i32,
+    pub rng_last: i32,
+}
+
+/// The game world state.
+pub struct World {
+    /// All actors keyed by ID. BTreeMap ensures deterministic iteration order.
+    actors: BTreeMap<u32, Actor>,
+    /// Synced effects (projectiles etc.) — empty for now.
+    synced_effects: Vec<i32>,
+    /// The shared RNG.
+    pub rng: MersenneTwister,
+    /// Whether the world simulation is paused.
+    pub paused: bool,
+    /// Current simulation tick.
+    pub world_tick: u32,
+    /// Current frame number.
+    pub frame_number: u32,
+    /// Network order latency (empty frames before game starts).
+    pub order_latency: u32,
+    /// Next actor ID to assign.
+    next_actor_id: u32,
+    /// Pending frame-end tasks.
+    frame_end_tasks: Vec<FrameEndTask>,
+    /// Player actor IDs in creation order.
+    player_actor_ids: Vec<u32>,
+    /// "Everyone" spectator player ID.
+    everyone_player_id: u32,
+    /// Number of mine actors (for SeedsResource RNG consumption).
+    mine_count: usize,
+    /// Ticks until next SeedsResource seeding event.
+    seeds_resource_ticks: i32,
+    /// Active production items per player actor ID.
+    production: HashMap<u32, Vec<ProductionItem>>,
+    /// Map dimensions (cells).
+    map_width: i32,
+    map_height: i32,
 }
 
 impl World {
     /// Compute World.SyncHash() matching the C# algorithm exactly.
     pub fn sync_hash(&self) -> i32 {
+        let actor_ids: Vec<u32> = self.actors.keys().copied().collect();
+        let actor_syncs: Vec<sync::ActorSync> = self.actors.values()
+            .filter(|a| !a.traits.is_empty())
+            .map(|a| sync::ActorSync {
+                actor_id: a.id,
+                trait_hashes: a.sync_hashes(),
+            })
+            .collect();
         sync::compute_world_sync_hash(
-            &self.all_actor_ids,
-            &self.sync_actors,
+            &actor_ids,
+            &actor_syncs,
             &self.synced_effects,
             self.rng.last,
-            &self.unlocked_render_player_ids,
+            &[], // unlocked_render_player_ids — always empty for now
         )
     }
 
     /// Compute SyncHash components separately for debugging.
     pub fn sync_hash_debug(&self) -> SyncHashDebug {
-        let identity = sync::compute_world_sync_hash(
-            &self.all_actor_ids, &[], &[], 0, &[],
-        );
-        let full_no_rng = sync::compute_world_sync_hash(
-            &self.all_actor_ids, &self.sync_actors, &[], 0, &[],
-        );
+        let actor_ids: Vec<u32> = self.actors.keys().copied().collect();
+        let identity = sync::compute_world_sync_hash(&actor_ids, &[], &[], 0, &[]);
+        let actor_syncs: Vec<sync::ActorSync> = self.actors.values()
+            .filter(|a| !a.traits.is_empty())
+            .map(|a| sync::ActorSync {
+                actor_id: a.id,
+                trait_hashes: a.sync_hashes(),
+            })
+            .collect();
+        let full_no_rng = sync::compute_world_sync_hash(&actor_ids, &actor_syncs, &[], 0, &[]);
         let traits = full_no_rng.wrapping_sub(identity);
-        let rng_last = self.rng.last;
-        let full = self.sync_hash();
-        SyncHashDebug { full, identity, traits, rng_last }
+        SyncHashDebug { full: self.sync_hash(), identity, traits, rng_last: self.rng.last }
     }
 
     /// Create a snapshot of the current world state for rendering.
     pub fn snapshot(&self) -> WorldSnapshot {
         let mut actors = Vec::new();
-        for &id in &self.all_actor_ids {
-            let kind = self.actor_kinds.get(&id).copied().unwrap_or(ActorKind::World);
-            // Skip non-renderable actors
-            if kind == ActorKind::World || kind == ActorKind::Player || kind == ActorKind::Spawn {
+        for actor in self.actors.values() {
+            if actor.kind == ActorKind::World || actor.kind == ActorKind::Player
+                || actor.kind == ActorKind::Spawn
+            {
                 continue;
             }
-            let owner = self.actor_owners.get(&id).copied().unwrap_or(0);
-            let (x, y) = self.actor_locations.get(&id).copied().unwrap_or((0, 0));
-            actors.push(ActorSnapshot { id, kind, owner, x, y });
+            let owner = actor.owner_id.unwrap_or(0);
+            let (x, y) = actor.location.unwrap_or((0, 0));
+            actors.push(ActorSnapshot { id: actor.id, kind: actor.kind, owner, x, y });
         }
-        let players: Vec<PlayerSnapshot> = self.player_actor_ids.iter().map(|&pid| {
-            PlayerSnapshot {
-                index: pid,
-                cash: self.player_cash.get(&pid).copied().unwrap_or(0),
-            }
+        let players = self.player_actor_ids.iter().map(|&pid| {
+            let cash = self.actors.get(&pid).map(|a| a.cash()).unwrap_or(0);
+            PlayerSnapshot { index: pid, cash }
         }).collect();
         WorldSnapshot {
             tick: self.world_tick,
@@ -304,23 +245,24 @@ impl World {
         let mut n: i32 = 0;
         let mut ret: i32 = 0;
 
-        // Identity hashes
-        for &actor_id in &self.all_actor_ids {
+        for (&actor_id, _) in &self.actors {
             let contrib = n.wrapping_mul((1i32).wrapping_add(actor_id as i32))
                 .wrapping_mul(sync::hash_actor(actor_id));
-            eprintln!("IDENTITY n={} actor_id={} contrib={} running={}", n, actor_id, contrib, ret.wrapping_add(contrib));
+            eprintln!("IDENTITY n={} actor_id={} contrib={} running={}",
+                n, actor_id, contrib, ret.wrapping_add(contrib));
             ret = ret.wrapping_add(contrib);
             n += 1;
         }
         eprintln!("AFTER_IDENTITY ret={} n={}", ret, n);
 
-        // Trait hashes
-        for actor_sync in &self.sync_actors {
-            for (ti, &trait_hash) in actor_sync.trait_hashes.iter().enumerate() {
-                let contrib = n.wrapping_mul((1i32).wrapping_add(actor_sync.actor_id as i32))
+        for actor in self.actors.values() {
+            if actor.traits.is_empty() { continue; }
+            for (ti, t) in actor.traits.iter().enumerate() {
+                let trait_hash = t.sync_hash();
+                let contrib = n.wrapping_mul((1i32).wrapping_add(actor.id as i32))
                     .wrapping_mul(trait_hash);
                 eprintln!("TRAIT n={} actor_id={} trait_idx={} hash={} contrib={} running={}",
-                    n, actor_sync.actor_id, ti, trait_hash, contrib, ret.wrapping_add(contrib));
+                    n, actor.id, ti, trait_hash, contrib, ret.wrapping_add(contrib));
                 ret = ret.wrapping_add(contrib);
                 n += 1;
             }
@@ -338,28 +280,24 @@ impl World {
     /// 2. ProcessOrders() — resolve orders from replay
     /// 3. SyncHash() — computed (this is what the replay records)
     /// 4. World.Tick() — advance simulation if not paused
-    ///
-    /// Returns the SyncHash as it would be recorded for this frame.
     pub fn process_frame(&mut self, orders: &[GameOrder]) -> i32 {
         self.frame_number += 1;
 
         // Auto-unpause after orderLatency buffer period.
-        // In C#, the server sends orderLatency empty frames before real orders flow.
-        // The world effectively pauses for that period.
         if self.paused && self.frame_number > self.order_latency {
             self.paused = false;
             self.update_debug_pause_state();
         }
 
-        // 1. Process orders (modifies state before SyncHash)
+        // 1. Process orders
         for order in orders {
             self.process_order(order);
         }
 
-        // 2. Compute SyncHash (this is what gets verified against replay)
+        // 2. Compute SyncHash
         let hash = self.sync_hash();
 
-        // 3. Tick the world if not paused (NetFrameInterval=3: 3 world ticks per net frame)
+        // 3. Tick the world if not paused (NetFrameInterval=3)
         if !self.paused {
             for _ in 0..3 {
                 self.world_tick += 1;
@@ -371,12 +309,14 @@ impl World {
         hash
     }
 
-    /// Update DebugPauseState hash in sync_actors (world actor, ID=0).
+    /// Update DebugPauseState on the World actor (ID=0).
     fn update_debug_pause_state(&mut self) {
-        if let Some(world_sync) = self.sync_actors.iter_mut().find(|a| a.actor_id == 0) {
-            // DebugPauseState is the only trait on the world actor (index 0)
-            if !world_sync.trait_hashes.is_empty() {
-                world_sync.trait_hashes[0] = hash_bool(self.paused);
+        if let Some(world_actor) = self.actors.get_mut(&0) {
+            for t in &mut world_actor.traits {
+                if let TraitState::DebugPauseState { paused } = t {
+                    *paused = self.paused;
+                    return;
+                }
             }
         }
     }
@@ -391,12 +331,11 @@ impl World {
             }
             "DeployTransform" => {
                 if let Some(subject_id) = order.subject_id {
-                    // Start the Turn activity: MCV turns toward deploy facing (384)
-                    if let Some(mcv) = self.mcv_states.iter_mut().find(|m| m.actor_id == subject_id) {
-                        mcv.is_turning = true;
-                        mcv.turn_target = 384; // MCV Transforms Facing
-                        eprintln!("ORDER: DeployTransform subject={} facing={} -> target={}",
-                            subject_id, mcv.facing, mcv.turn_target);
+                    if let Some(actor) = self.actors.get_mut(&subject_id) {
+                        if actor.kind == ActorKind::Mcv {
+                            actor.activity = Some(Activity::Turn { target: 384, speed: 20 });
+                            eprintln!("ORDER: DeployTransform subject={}", subject_id);
+                        }
                     }
                 }
             }
@@ -419,14 +358,12 @@ impl World {
                     };
                     if cost > 0 {
                         eprintln!("ORDER: StartProduction subject={} item={} cost={}", subject_id, item_name, cost);
-                        let item = ProductionItem::new(cost, 60); // BuildDurationModifier=60
+                        let item = ProductionItem::new(cost, 60);
                         self.production.entry(subject_id).or_default().push(item);
                     }
                 }
             }
-            "StartGame" | "Command" => {
-                // Lobby/control orders — no simulation effect
-            }
+            "StartGame" | "Command" => {}
             other => {
                 eprintln!("ORDER: unhandled '{}' subject={:?}", other, order.subject_id);
             }
@@ -435,81 +372,79 @@ impl World {
 
     /// Tick all actors (activities and ITick traits).
     fn tick_actors(&mut self) {
-        // On the first tick, ClassicProductionQueue.Tick() sets Enabled=false
-        // (no Production buildings exist yet). This changes the PQ hash from
-        // 0 (true^true) to 1 (false^true) for each of the 6 PQs on each player.
-        if self.world_tick == 1 && self.pq_enabled {
-            self.pq_enabled = false;
-            self.update_pq_hashes();
+        // On tick 1, ClassicProductionQueue.Tick() sets Enabled=false
+        // (no Production buildings exist yet).
+        if self.world_tick == 1 {
+            for &pid in &self.player_actor_ids {
+                if let Some(player) = self.actors.get_mut(&pid) {
+                    for t in &mut player.traits {
+                        if let TraitState::ClassicProductionQueue { enabled, .. } = t {
+                            *enabled = false;
+                        }
+                    }
+                }
+            }
         }
 
-        // Note: the 14 RNG calls at tick 1 are now handled by SeedsResource
-        // (7 mines × 2 RNG calls each, firing at interval=75 which fires immediately
-        // on tick 1 since ticks starts at 0).
-
         // SeedsResource: each MINE actor seeds ore every 75 ticks.
-        // Fires at ticks 1, 76, 151, 226, ... consuming 2 RNG calls per mine.
-        // The 7 mines on the "singles" map consume 14 RNG calls per seeding event.
-        // RandomWalk uses SharedRandom.Next(-1, 2) twice per step.
+        // Fires at ticks 1, 76, 151, ... consuming 2 RNG calls per mine.
         if self.seeds_resource_ticks > 0 {
             self.seeds_resource_ticks -= 1;
         }
         if self.seeds_resource_ticks <= 0 {
             for _ in 0..self.mine_count {
-                // Each mine does Util.RandomWalk which calls rng.Next(-1,2) twice.
-                // In the common case, the first step lands on a valid cell.
                 self.rng.next_range(-1, 2); // dx
                 self.rng.next_range(-1, 2); // dy
             }
-            self.seeds_resource_ticks = 75; // Reset interval
+            self.seeds_resource_ticks = 75;
         }
 
-        // Tick MCV Turn activities: change facing toward deploy target.
-        // When facing reaches target, queue the deploy frame-end task.
-        //
-        // C# Turn.Tick always returns false after TickFacing (even if target reached),
-        // and returns true on the NEXT tick when desiredFacing==facing. However, the
-        // deploy still happens in the same tick's frame-end because TickOuter propagates
-        // the completion to Transform.Tick within the same RunActivity call.
+        // Tick Turn activities: change facing toward target.
+        // When facing reaches target, queue deploy for MCVs.
         let mut deploy_ready: Vec<(u32, (i32, i32), u32)> = Vec::new();
-        for mcv in &mut self.mcv_states {
-            if !mcv.is_turning {
-                continue;
-            }
-            let new_facing = tick_facing(mcv.facing, mcv.turn_target, mcv.turn_speed);
-            mcv.facing = new_facing;
-            // Update Mobile sync hash for this MCV
-            let new_mobile_hash = mobile_sync_hash(mcv.spawn_x, mcv.spawn_y, mcv.facing);
-            if let Some(actor_sync) = self.sync_actors.iter_mut().find(|a| a.actor_id == mcv.actor_id) {
-                // Mobile is trait index 1 in MCV trait list
-                if actor_sync.trait_hashes.len() > 1 {
-                    actor_sync.trait_hashes[1] = new_mobile_hash;
+        for actor in self.actors.values_mut() {
+            if let Some(Activity::Turn { target, speed }) = &actor.activity {
+                let target = *target;
+                let speed = *speed;
+
+                // Read current facing from Mobile trait
+                let current_facing = actor.traits.iter()
+                    .find_map(|t| {
+                        if let TraitState::Mobile { facing, .. } = t { Some(*facing) } else { None }
+                    })
+                    .unwrap_or(0);
+
+                let new_facing = tick_facing(current_facing, target, speed);
+
+                // Update Mobile trait
+                for t in &mut actor.traits {
+                    if let TraitState::Mobile { facing, .. } = t {
+                        *facing = new_facing;
+                        break;
+                    }
                 }
-            }
-            // Check if turn is complete
-            if mcv.facing == mcv.turn_target {
-                mcv.is_turning = false;
-                deploy_ready.push((mcv.actor_id, (mcv.spawn_x, mcv.spawn_y), mcv.owner_player_id));
+
+                if new_facing == target {
+                    actor.activity = None;
+                    if actor.kind == ActorKind::Mcv {
+                        if let (Some(loc), Some(owner)) = (actor.location, actor.owner_id) {
+                            deploy_ready.push((actor.id, loc, owner));
+                        }
+                    }
+                }
             }
         }
 
         // Tick production queues: consume cash, advance build time.
         let player_ids: Vec<u32> = self.production.keys().copied().collect();
         for pid in player_ids {
+            let cash = self.actors.get(&pid).map(|a| a.cash()).unwrap_or(0);
             if let Some(items) = self.production.get_mut(&pid) {
                 if let Some(item) = items.first_mut() {
-                    let cash = self.player_cash.get(&pid).copied().unwrap_or(0);
                     let consumed = item.tick(cash);
                     if consumed > 0 {
-                        *self.player_cash.entry(pid).or_insert(0) -= consumed;
-                        // Update PlayerResources sync hash
-                        let new_cash = self.player_cash[&pid];
-                        if let Some(player_sync) = self.sync_actors.iter_mut().find(|a| a.actor_id == pid) {
-                            if player_sync.trait_hashes.len() > 1 {
-                                // PlayerResources hash = Cash ^ Resources ^ ResourceCapacity
-                                // Resources and ResourceCapacity are 0 for now
-                                player_sync.trait_hashes[1] = new_cash;
-                            }
+                        if let Some(player) = self.actors.get_mut(&pid) {
+                            player.set_cash(cash - consumed);
                         }
                     }
                     if item.is_done() {
@@ -530,22 +465,6 @@ impl World {
         }
     }
 
-    /// Update PQ trait hashes for all player actors when Enabled changes.
-    /// PQ traits are at indices 6-11 in each player's sync trait list.
-    fn update_pq_hashes(&mut self) {
-        let new_hash = production_queue_sync_hash(self.pq_enabled, true);
-        for &pid in &self.player_actor_ids {
-            if let Some(actor_sync) = self.sync_actors.iter_mut().find(|a| a.actor_id == pid) {
-                // PQ traits are at indices 6-11
-                for i in 6..12 {
-                    if i < actor_sync.trait_hashes.len() {
-                        actor_sync.trait_hashes[i] = new_hash;
-                    }
-                }
-            }
-        }
-    }
-
     /// Execute frame-end tasks (actor removal/creation from Transform, etc.)
     fn execute_frame_end_tasks(&mut self) {
         let tasks: Vec<_> = self.frame_end_tasks.drain(..).collect();
@@ -559,115 +478,94 @@ impl World {
     }
 
     /// Deploy an MCV: remove it and create a Construction Yard.
-    /// The FACT is placed at MCV location + Transforms.Offset(-1,-1).
     fn deploy_transform(&mut self, mcv_actor_id: u32, mcv_location: (i32, i32), owner_player_id: u32) {
-        // FACT location = MCV cell + Offset(-1, -1)
         let fact_location = (mcv_location.0 - 1, mcv_location.1 - 1);
         eprintln!("DEPLOY: removing MCV actor {} at {:?}, creating FACT at {:?}",
             mcv_actor_id, mcv_location, fact_location);
 
-        // Remove MCV from actor lists and mcv_states
-        self.all_actor_ids.retain(|&id| id != mcv_actor_id);
-        self.sync_actors.retain(|a| a.actor_id != mcv_actor_id);
-        self.mcv_states.retain(|m| m.actor_id != mcv_actor_id);
-        self.actor_kinds.remove(&mcv_actor_id);
-        self.actor_owners.remove(&mcv_actor_id);
+        // Remove MCV
+        self.actors.remove(&mcv_actor_id);
 
-        // Create Construction Yard (fact) with new actor ID
+        // Create Construction Yard (FACT) with new actor ID
         let fact_id = self.next_actor_id;
         self.next_actor_id += 1;
 
-        // Insert into actor lists maintaining ActorID sort order
-        let insert_pos = self.all_actor_ids.partition_point(|&id| id < fact_id);
-        self.all_actor_ids.insert(insert_pos, fact_id);
-
-        // FACT ISync traits in construction order:
-        //
-        // First batch (no Requires): YAML order
-        //   0. BodyOrientation (from ^SpriteActor) - QuantizedFacings = 1
-        //   1. Building (from ^BasicBuilding) - TopLeft
-        //   2. Health (from ^BasicBuilding, FACT overrides HP=150000)
-        //   3. RevealsShroud (from FACT) - base class private fields invisible → 0
-        //   4. RevealsShroud@GAPGEN (from FACT) - same → 0
-        //
-        // Second batch (Requires satisfied):
-        //   5. FrozenUnderFog (Requires<BuildingInfo>) - VisibilityHash = 0
-        //   6. RepairableBuilding (Requires<IHealthInfo>) - RepairersHash = 0
-        //   7. ConyardChronoReturn (Requires<HealthInfo,WithSpriteBodyInfo>) - all zero
         let top_left = CPos::new(fact_location.0, fact_location.1);
-        let fact_sync = sync::ActorSync {
-            actor_id: fact_id,
-            trait_hashes: vec![
-                1,                             // BodyOrientation: QuantizedFacings = 1
-                building_sync_hash(top_left),  // Building: TopLeft
-                health_sync_hash(150000),      // Health: HP = 150000
-                0,                             // RevealsShroud (base class fields invisible)
-                0,                             // RevealsShroud@GAPGEN
-                0,                             // FrozenUnderFog: VisibilityHash = 0
-                0,                             // RepairableBuilding: RepairersHash = 0
-                0,                             // ConyardChronoReturn: all fields zero
+        // FACT ISync traits in construction order:
+        //   0. BodyOrientation (QuantizedFacings=1)
+        //   1. Building (TopLeft)
+        //   2. Health (HP=150000)
+        //   3. RevealsShroud (base class fields invisible → 0)
+        //   4. RevealsShroud@GAPGEN (same → 0)
+        //   5. FrozenUnderFog (VisibilityHash=0, updated below)
+        //   6. RepairableBuilding (RepairersHash=0)
+        //   7. ConyardChronoReturn (all zero)
+        let fact_actor = Actor {
+            id: fact_id,
+            kind: ActorKind::Building,
+            owner_id: Some(owner_player_id),
+            location: Some(fact_location),
+            traits: vec![
+                TraitState::BodyOrientation { quantized_facings: 1 },
+                TraitState::Building { top_left },
+                TraitState::Health { hp: 150000 },
+                TraitState::RevealsShroud,
+                TraitState::RevealsShroud, // @GAPGEN
+                TraitState::FrozenUnderFog { visibility_hash: 0 },
+                TraitState::RepairableBuilding { repairers_hash: 0 },
+                TraitState::ConyardChronoReturn,
             ],
+            activity: None,
         };
-        let sync_pos = self.sync_actors.partition_point(|a| a.actor_id < fact_id);
-        self.sync_actors.insert(sync_pos, fact_sync);
-
-        self.actor_locations.insert(fact_id, fact_location);
-        self.actor_kinds.insert(fact_id, ActorKind::Building);
-        self.actor_owners.insert(fact_id, owner_player_id);
+        self.actors.insert(fact_id, fact_actor);
 
         eprintln!("DEPLOY: created FACT actor {} at {:?} TopLeft.bits={}",
             fact_id, fact_location, top_left.bits);
-        if let Some(fs) = self.sync_actors.iter().find(|a| a.actor_id == fact_id) {
-            for (i, h) in fs.trait_hashes.iter().enumerate() {
-                eprintln!("  FACT trait[{}] hash={}", i, h);
-            }
-        }
 
         // === Side effects from subsequent ticks within the same NetFrameInterval ===
-        // In C# with NetFrameInterval=3, the remaining 2 ticks after FACT creation
-        // process these updates before the next SyncHash computation.
 
-        // 1. Re-enable PQ@Building (index 6) and PQ@Defense (index 7) for owning player.
-        //    FACT has Production@Building and Production@Defense traits, so
-        //    ClassicProductionQueue.Tick() finds a production building and sets Enabled=true.
-        if let Some(owner_sync) = self.sync_actors.iter_mut().find(|a| a.actor_id == owner_player_id) {
-            if owner_sync.trait_hashes.len() > 7 {
-                owner_sync.trait_hashes[6] = production_queue_sync_hash(true, true);
-                owner_sync.trait_hashes[7] = production_queue_sync_hash(true, true);
+        // 1. Re-enable PQ@Building and PQ@Defense for owning player.
+        if let Some(owner) = self.actors.get_mut(&owner_player_id) {
+            for t in &mut owner.traits {
+                if let TraitState::ClassicProductionQueue { pq_type, enabled, .. } = t {
+                    if *pq_type == PqType::Building || *pq_type == PqType::Defense {
+                        *enabled = true;
+                    }
+                }
             }
         }
 
-        // 2. Update FrozenActorLayer (index 13) for ALL players.
-        //    C# FrozenActorLayer.Tick() recalculates every tick:
-        //      FrozenHash = Σ id (all frozen actors)
-        //      VisibilityHash = Σ id (frozen actors where Visible=true, i.e. under fog)
-        //      trait_hash = FrozenHash ^ VisibilityHash
-        //    A new FACT is added as frozen actor for ALL players. For the owner and
-        //    Everyone, Visible=false (can see it), so only FrozenHash increases.
-        //    For other players, Visible=true (under fog), so both FH and VH increase,
-        //    and the XOR contribution is: (FH+id) ^ (VH+id) vs FH ^ VH.
-        self.update_fal_for_new_building(fact_id, owner_player_id);
+        // 2. Update FrozenActorLayer for ALL players.
+        let everyone_id = self.everyone_player_id;
+        let player_ids = self.player_actor_ids.clone();
+        for &pid in &player_ids {
+            if let Some(player) = self.actors.get_mut(&pid) {
+                for t in &mut player.traits {
+                    if let TraitState::FrozenActorLayer { frozen_hash, visibility_hash } = t {
+                        *frozen_hash = frozen_hash.wrapping_add(fact_id as i32);
+                        let can_see = pid == owner_player_id || pid == everyone_id;
+                        if !can_see {
+                            *visibility_hash = visibility_hash.wrapping_add(fact_id as i32);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
 
-        // 3. Update FrozenUnderFog VisibilityHash on FACT (trait index 5).
-        //    Encodes which players can see the FACT, computed in reverse player order:
-        //    hash = hash * 2 + (visible ? 1 : 0)
+        // 3. Update FrozenUnderFog VisibilityHash on FACT.
         let visibility_hash = self.compute_frozen_visibility_hash(owner_player_id);
-        if let Some(fact_sync) = self.sync_actors.iter_mut().find(|a| a.actor_id == fact_id) {
-            if fact_sync.trait_hashes.len() > 5 {
-                fact_sync.trait_hashes[5] = visibility_hash;
+        if let Some(fact) = self.actors.get_mut(&fact_id) {
+            for t in &mut fact.traits {
+                if let TraitState::FrozenUnderFog { visibility_hash: vh } = t {
+                    *vh = visibility_hash;
+                    break;
+                }
             }
         }
-    }
-
-    /// Find an actor's cell location from its sync trait data.
-    fn find_actor_location(&self, actor_id: u32) -> Option<(i32, i32)> {
-        // Look up the actor in our location map
-        self.actor_locations.get(&actor_id).copied()
     }
 
     /// Compute FrozenUnderFog VisibilityHash for an actor visible to owner and Everyone.
-    /// C# iterates players in reverse creation order:
-    ///   hash = hash * 2 + (visible ? 1 : 0)
     fn compute_frozen_visibility_hash(&self, owner_player_id: u32) -> i32 {
         let mut hash = 0i32;
         for &pid in self.player_actor_ids.iter().rev() {
@@ -676,43 +574,9 @@ impl World {
         }
         hash
     }
-
-    /// Update FrozenActorLayer (trait index 13) for all players when a new building
-    /// is created. The building is visible to owner and Everyone; under fog for others.
-    ///
-    /// C# FrozenActorLayer stores per-player:
-    ///   FrozenHash = Σ frozen_actor_id
-    ///   VisibilityHash = Σ frozen_actor_id where Visible=true (under fog)
-    ///   sync_hash = FrozenHash ^ VisibilityHash
-    fn update_fal_for_new_building(&mut self, building_id: u32, owner_player_id: u32) {
-        let everyone_id = self.everyone_player_id;
-        let player_ids: Vec<u32> = self.player_actor_ids.clone();
-        for &pid in &player_ids {
-            let state = self.fal_state.entry(pid).or_insert((0i32, 0i32));
-            state.0 = state.0.wrapping_add(building_id as i32); // FrozenHash
-            let can_see = pid == owner_player_id || pid == everyone_id;
-            if !can_see {
-                state.1 = state.1.wrapping_add(building_id as i32); // VisibilityHash
-            }
-            let new_hash = state.0 ^ state.1;
-            if let Some(player_sync) = self.sync_actors.iter_mut().find(|a| a.actor_id == pid) {
-                if player_sync.trait_hashes.len() > 13 {
-                    player_sync.trait_hashes[13] = new_hash;
-                }
-            }
-        }
-    }
-}
-
-pub struct SyncHashDebug {
-    pub full: i32,
-    pub identity: i32,
-    pub traits: i32,
-    pub rng_last: i32,
 }
 
 /// Tick facing toward target by step, matching C#'s Util.TickFacing(WAngle).
-/// All values are in WAngle units (0-1023, wrapping).
 fn tick_facing(facing: i32, desired: i32, step: i32) -> i32 {
     let left_turn = ((facing - desired) % 1024 + 1024) % 1024;
     if left_turn < step {
@@ -730,172 +594,11 @@ fn tick_facing(facing: i32, desired: i32, step: i32) -> i32 {
 }
 
 /// Convert a cell position to world position (rectangular grid).
-/// CenterOfCell(cell) = WPos(1024*x + 512, 1024*y + 512, 0)
 pub fn center_of_cell(x: i32, y: i32) -> WPos {
     WPos::new(1024 * x + 512, 1024 * y + 512, 0)
 }
 
-// === Trait sync hash helpers ===
-
-/// Building trait: [VerifySync] CPos TopLeft
-fn building_sync_hash(top_left: CPos) -> i32 {
-    sync::hash_cpos(top_left)
-}
-
-/// Immobile trait: [VerifySync] CPos TopLeft, [VerifySync] WPos CenterPosition
-fn immobile_sync_hash(top_left: CPos, center_pos: WPos) -> i32 {
-    sync::hash_cpos(top_left) ^ sync::hash_wpos(center_pos)
-}
-
-/// Health trait: [VerifySync] int HP
-fn health_sync_hash(hp: i32) -> i32 {
-    hp
-}
-
-// === Player trait sync hashes at tick 0 ===
-//
-// The Player actor ("Player" in player.yaml) has these ISync traits.
-// Construction order is resolved by dependency topological sort.
-//
-// YAML order:
-//   Shroud, PlayerResources, TechTree, ClassicPQ×6, PlaceBuilding,
-//   SupportPowerManager, ScriptTriggers, MissionObjectives, ConquestVictoryConditions,
-//   PowerManager, AllyRepair, PlayerResources(override), DeveloperMode, GpsWatcher,
-//   Shroud(override), ..., FrozenActorLayer, ..., PlayerExperience, ...
-//
-// Dependencies:
-//   ClassicProductionQueue requires TechTree + PlayerResources (both before it → OK)
-//   PowerManager requires DeveloperMode (DeveloperMode is AFTER PowerManager in YAML)
-//     → PowerManager must be constructed after DeveloperMode
-//
-// ISync traits only (in construction order):
-//   1. Shroud           - 1 bool field: disabled=false
-//   2. PlayerResources  - 3 int fields: Cash, Resources, ResourceCapacity (XOR'd)
-//   3. ClassicPQ@Building  - 2 bool props: Enabled, IsValidFaction
-//   4. ClassicPQ@Defense   - 2 bool props: Enabled, IsValidFaction
-//   5. ClassicPQ@Vehicle   - 2 bool props: Enabled, IsValidFaction
-//   6. ClassicPQ@Infantry  - 2 bool props: Enabled, IsValidFaction
-//   7. ClassicPQ@Ship      - 2 bool props: Enabled, IsValidFaction
-//   8. ClassicPQ@Aircraft  - 2 bool props: Enabled, IsValidFaction
-//   9. MissionObjectives   - 1 int prop: ObjectivesHash=0
-//  10. DeveloperMode       - 7 bool fields: all false at tick 0
-//  11. PowerManager        - 2 int props: PowerProvided=0, PowerDrained=0
-//  12. GpsWatcher          - 3 bool props + 1 bool field: all false
-//  13. FrozenActorLayer    - 2 int fields: VisibilityHash=0, FrozenHash=0
-//  14. PlayerExperience    - 1 int prop: Experience=0
-
-/// Compute the trait hash for Shroud at tick 0.
-/// [VerifySync] bool disabled = false
-fn shroud_sync_hash() -> i32 {
-    hash_bool(false)
-}
-
-/// Compute the trait hash for PlayerResources at tick 0.
-/// [VerifySync] int Cash, [VerifySync] int Resources, [VerifySync] int ResourceCapacity
-/// Fields are XOR'd. At tick 0: Cash=startingCash, Resources=0, ResourceCapacity=0
-fn player_resources_sync_hash(starting_cash: i32) -> i32 {
-    starting_cash ^ 0 ^ 0
-}
-
-/// Compute the trait hash for a single ClassicProductionQueue at tick 0.
-/// [VerifySync] bool Enabled (property), [VerifySync] bool IsValidFaction (property)
-///
-/// The GenerateHashFunc iterates fields first, then properties.
-/// Both Enabled and IsValidFaction are properties.
-///
-/// At tick 0 for a playable player with a non-locked "Random" faction:
-///   IsValidFaction is set based on whether the queue's configured Factions
-///   match the player's resolved faction. For RA, production queues have no
-///   Factions restriction by default, so IsValidFaction = true.
-///   Enabled starts as IsValidFaction value.
-///
-/// For non-playable players (Neutral, Creeps): they also get the Player actor
-/// and production queues, but IsValidFaction depends on faction matching.
-fn production_queue_sync_hash(enabled: bool, is_valid_faction: bool) -> i32 {
-    // Properties only, no fields with [VerifySync]
-    hash_bool(enabled) ^ hash_bool(is_valid_faction)
-}
-
-/// Compute the trait hash for MissionObjectives at tick 0.
-/// [VerifySync] int ObjectivesHash = 0 (property)
-fn mission_objectives_sync_hash() -> i32 {
-    0
-}
-
-/// Compute the trait hash for DeveloperMode at tick 0.
-/// 7 [VerifySync] bool fields, all false at tick 0.
-/// XOR of 7 copies of 0x555 = 0x555 (odd count)
-fn developer_mode_sync_hash() -> i32 {
-    xor_bools(&[false; 7])
-}
-
-/// Compute the trait hash for PowerManager at tick 0.
-/// [VerifySync] int PowerProvided = 0, [VerifySync] int PowerDrained = 0
-fn power_manager_sync_hash() -> i32 {
-    0 ^ 0
-}
-
-/// Compute the trait hash for GpsWatcher at tick 0.
-/// Fields: [VerifySync] bool explored = false
-/// Properties: [VerifySync] bool Launched = false, GrantedAllies = false, Granted = false
-/// Fields first, then properties, all XOR'd.
-fn gps_watcher_sync_hash() -> i32 {
-    // 1 field + 3 properties = 4 bools, all false
-    xor_bools(&[false; 4])
-}
-
-/// Compute the trait hash for FrozenActorLayer at tick 0.
-/// [VerifySync] int VisibilityHash = 0, [VerifySync] int FrozenHash = 0
-fn frozen_actor_layer_sync_hash() -> i32 {
-    0 ^ 0
-}
-
-/// Compute the trait hash for PlayerExperience at tick 0.
-/// [VerifySync] int Experience = 0
-fn player_experience_sync_hash() -> i32 {
-    0
-}
-
-/// Compute the trait hash for Mobile at tick 0.
-/// [VerifySync] WAngle Facing, CPos FromCell, CPos ToCell, WPos CenterPosition
-/// All properties (no fields). At tick 0: FromCell == ToCell (stationary).
-/// Facing is randomized via SharedRandom.Next(1024) during SpawnStartingUnits.
-fn mobile_sync_hash(cell_x: i32, cell_y: i32, facing: i32) -> i32 {
-    let center = center_of_cell(cell_x, cell_y);
-    // hash = Facing XOR FromCell.Bits XOR ToCell.Bits XOR WPos.hash
-    // FromCell == ToCell, so they cancel: hash = Facing XOR WPos.hash
-    facing ^ center.sync_hash()
-}
-
-/// Build the ISync trait hashes for an MCV actor at tick 0.
-///
-/// MCV traits (in construction order):
-/// 1. ClassicFacingBodyOrientation: QuantizedFacings = 32
-/// 2. Mobile: position-dependent, facing from RNG
-/// 3. Chronoshiftable: CPos Origin=Zero, int ReturnTicks=0 → hash=0
-/// 4. Health: HP = 60000
-/// 5. RevealsShroud (AffectsShroud): cachedLocation=Zero, cachedRange=Zero,
-///    CachedTraitDisabled=false → hash=0
-fn mcv_trait_hashes(spawn_x: i32, spawn_y: i32, facing: i32) -> Vec<i32> {
-    // RevealsShroud hash = 0: private [VerifySync] fields on AffectsShroud base class
-    // are NOT visible to reflection on RevealsShroud derived type.
-    vec![
-        32,                                          // ClassicFacingBodyOrientation: QuantizedFacings
-        mobile_sync_hash(spawn_x, spawn_y, facing),  // Mobile
-        0,                                           // Chronoshiftable
-        60000,                                       // Health: HP
-        0,                                           // RevealsShroud (base class fields invisible)
-    ]
-}
-
 /// Assign spawn points to playable players using the playerRandom sequence.
-///
-/// This replicates the C# CreateMapPlayers + MapStartingLocations logic:
-/// 1. Non-playable players: ResolveFaction (no RNG if faction has no RandomFactionMembers)
-/// 2. Playable players: ResolveFaction (consumes RNG) + AssignHomeLocation
-/// 3. "Everyone": ResolveFaction (consumes RNG)
-///
-/// Returns spawn locations for each playable player in lobby slot order.
 fn assign_spawn_points(
     spawn_locations: &[(i32, i32)],
     num_playable: usize,
@@ -904,36 +607,23 @@ fn assign_spawn_points(
 ) -> Vec<(i32, i32)> {
     let mut player_rng = MersenneTwister::new(seed);
 
-    // Non-playable players: ResolveFaction for each
-    // In RA mod, non-playable players have faction "allies" which has no
-    // RandomFactionMembers → no RNG consumption.
-    // (allies is defined with Selectable: False and no RandomFactionMembers)
+    // Non-playable players: ResolveFaction for each.
+    // "allies" faction has no RandomFactionMembers → no RNG consumption.
     for p in map_players {
         if !p.playable {
-            // ResolveFaction("allies", ..., requireSelectable=false)
-            // "allies" has no RandomFactionMembers → no RNG call
-            // (nothing to do)
+            // nothing to do
         }
     }
 
-    // Playable players: ResolveFaction + AssignHomeLocation
-    // Each "Random" faction resolution: Random→{RandomAllies|RandomSoviet}→{specific}
-    // = 2 RNG calls per player for faction
-    // First player: 1 RNG call for spawn point (random from available)
-    // Subsequent: 0 calls (separateTeamSpawns uses MaxBy = deterministic)
     let mut available_spawns: Vec<usize> = (0..spawn_locations.len()).collect();
     let mut assignments = Vec::new();
 
     for i in 0..num_playable {
         // ResolveFaction("Random"): 2 playerRandom calls
-        // Call 1: Random.RandomFactionMembers = [RandomAllies, RandomSoviet] → Next(2)
         let meta_faction = player_rng.next_range(0, 2);
-        eprintln!("playerRNG[{}]: meta_faction={} (0=RandomAllies, 1=RandomSoviet) rng.last={} total={}",
+        eprintln!("playerRNG[{}]: meta_faction={} rng.last={} total={}",
             i, meta_faction, player_rng.last, player_rng.total_count);
 
-        // Call 2: pick specific faction from meta-faction
-        // RandomAllies: [england, france, germany] → Next(3)
-        // RandomSoviet: [russia, ukraine] → Next(2)
         if meta_faction == 0 {
             let specific = player_rng.next_range(0, 3);
             eprintln!("playerRNG[{}]: specific_allies={} rng.last={} total={}",
@@ -946,236 +636,189 @@ fn assign_spawn_points(
 
         // AssignHomeLocation
         if i == 0 {
-            // First player: random from available spawn points
             let idx = player_rng.next_range(0, available_spawns.len() as i32) as usize;
             eprintln!("playerRNG[{}]: spawn_idx={} from {} available, rng.last={} total={}",
                 i, idx, available_spawns.len(), player_rng.last, player_rng.total_count);
             let spawn_idx = available_spawns.remove(idx);
             assignments.push(spawn_locations[spawn_idx]);
         } else {
-            // Subsequent: separateTeamSpawns=true → pick most distant (deterministic)
             let spawn_idx = available_spawns.remove(0);
             assignments.push(spawn_locations[spawn_idx]);
         }
     }
 
-    // "Everyone" player: ResolveFaction("Random", ..., requireSelectable=false)
-    // With requireSelectable=false, selectableFactions includes ALL factions.
-    // "Random" is found → RandomFactionMembers = [RandomAllies, RandomSoviet] → 2 calls
-    // (We don't need to actually compute this since it doesn't affect spawn assignments)
-
     assignments
 }
 
-/// Build the ISync trait hashes for a player actor at tick 0.
-///
-/// `is_playable` determines production queue Enabled/IsValidFaction defaults.
-fn player_trait_hashes(starting_cash: i32, is_playable: bool) -> Vec<i32> {
-    // Production queues: for playable players, Enabled=true, IsValidFaction=true
-    // For non-playable (Neutral, Creeps), they don't have valid factions for
-    // production, but the trait still exists. IsValidFaction depends on faction config.
-    // In practice, non-playable players have faction "allies"/"Random" and
-    // the production queues have no faction filter → IsValidFaction = true, Enabled = true.
-    let pq_enabled = true;
-    let pq_valid_faction = true;
+/// Build ISync traits for a player actor at tick 0.
+fn build_player_traits(starting_cash: i32) -> Vec<TraitState> {
+    let mut traits = Vec::new();
 
-    let mut hashes = Vec::new();
-
-    // ISync traits in TraitsInConstructOrder() — dependency-resolved order:
-    //
-    // Initial batch (no Requires, no NotBefore): YAML order
+    // Construction order (dependency-resolved):
+    // Initial batch (no Requires):
     //   0. Shroud
     //   1. PlayerResources
     //   2. MissionObjectives
     //   3. DeveloperMode
     //   4. GpsWatcher
     //   5. PlayerExperience
-    //
-    // Second batch (Requires now met): YAML order within batch
-    //   6-11. ClassicProductionQueue×6  (Requires TechTree + PlayerResources)
-    //   12.   PowerManager              (Requires DeveloperMode)
-    //   13.   FrozenActorLayer          (Requires Shroud)
-    //
-    // Note: FrozenActorLayer has Requires<ShroudInfo>, putting it in the
-    // dependency-resolved batch rather than the initial batch. This shifts
-    // PQ positions from [7-12] to [6-11], which matters for the sync hash
-    // delta when PQ Enabled changes on the first tick.
+    // Second batch (Requires met):
+    //   6-11. ClassicProductionQueue×6
+    //   12.   PowerManager
+    //   13.   FrozenActorLayer
 
-    // 0. Shroud
-    hashes.push(shroud_sync_hash());
+    traits.push(TraitState::Shroud { disabled: false });
+    traits.push(TraitState::PlayerResources { cash: starting_cash, resources: 0, resource_capacity: 0 });
+    traits.push(TraitState::MissionObjectives { objectives_hash: 0 });
+    traits.push(TraitState::DeveloperMode { flags: [false; 7] });
+    traits.push(TraitState::GpsWatcher {
+        explored: false, launched: false, granted_allies: false, granted: false,
+    });
+    traits.push(TraitState::PlayerExperience { experience: 0 });
 
-    // 1. PlayerResources
-    hashes.push(player_resources_sync_hash(starting_cash));
-
-    // 2. MissionObjectives
-    hashes.push(mission_objectives_sync_hash());
-
-    // 3. DeveloperMode
-    hashes.push(developer_mode_sync_hash());
-
-    // 4. GpsWatcher
-    hashes.push(gps_watcher_sync_hash());
-
-    // 5. PlayerExperience
-    hashes.push(player_experience_sync_hash());
-
-    // 6-11. ClassicProductionQueue × 6 (second batch)
-    for _ in 0..6 {
-        hashes.push(production_queue_sync_hash(pq_enabled, pq_valid_faction));
+    for &pq_type in PqType::ALL {
+        traits.push(TraitState::ClassicProductionQueue {
+            pq_type,
+            enabled: true,
+            is_valid_faction: true,
+        });
     }
 
-    // 12. PowerManager (second batch)
-    hashes.push(power_manager_sync_hash());
+    traits.push(TraitState::PowerManager { power_provided: 0, power_drained: 0 });
+    traits.push(TraitState::FrozenActorLayer { frozen_hash: 0, visibility_hash: 0 });
 
-    // 13. FrozenActorLayer (second batch, Requires<Shroud>)
-    hashes.push(frozen_actor_layer_sync_hash());
+    traits
+}
 
-    let _ = is_playable; // May be used for future differentiation
-
-    hashes
+/// Build ISync traits for an MCV actor at tick 0.
+fn build_mcv_traits(spawn_x: i32, spawn_y: i32, facing: i32) -> Vec<TraitState> {
+    let cell = CPos::new(spawn_x, spawn_y);
+    let center = center_of_cell(spawn_x, spawn_y);
+    vec![
+        TraitState::BodyOrientation { quantized_facings: 32 },
+        TraitState::Mobile { facing, from_cell: cell, to_cell: cell, center_position: center },
+        TraitState::Chronoshiftable { origin: CPos::new(0, 0), return_ticks: 0 },
+        TraitState::Health { hp: 60000 },
+        TraitState::RevealsShroud,
+    ]
 }
 
 /// Build a World from parsed map data, game seed, and lobby info.
-///
-/// This is the initial world state (tick 0). Actor IDs are assigned:
-/// 0 = World actor, 1-N = player actors, N+1.. = map actors.
 pub fn build_world(
     map: &openra_data::oramap::OraMap,
     random_seed: i32,
     lobby: &LobbyInfo,
 ) -> World {
-    let mut rng = MersenneTwister::new(random_seed);
-    let mut all_actor_ids: Vec<u32> = Vec::new();
-    let mut sync_actors: Vec<sync::ActorSync> = Vec::new();
-    let mut actor_locations: HashMap<u32, (i32, i32)> = HashMap::new();
-    let mut actor_kinds: HashMap<u32, ActorKind> = HashMap::new();
-    let mut actor_owners: HashMap<u32, u32> = HashMap::new();
+    let rng = MersenneTwister::new(random_seed);
+    let mut actors: BTreeMap<u32, Actor> = BTreeMap::new();
     let mut next_id: u32 = 0;
 
     // === Actor ID 0: World actor ===
-    // ISync traits: DebugPauseState (1 bool: IsWorldPaused = false at tick 0)
-    all_actor_ids.push(next_id);
-    actor_kinds.insert(next_id, ActorKind::World);
-    sync_actors.push(sync::ActorSync {
-        actor_id: next_id,
-        trait_hashes: vec![hash_bool(true)], // DebugPauseState: IsWorldPaused=true at tick 0
+    actors.insert(next_id, Actor {
+        id: next_id,
+        kind: ActorKind::World,
+        owner_id: None,
+        location: None,
+        traits: vec![TraitState::DebugPauseState { paused: true }],
+        activity: None,
     });
     next_id += 1;
 
     // === Player actors ===
-    // Order: non-playable first (in map YAML order), then playable (slot order),
-    // then "Everyone" spectator.
     let mut player_actor_ids: Vec<u32> = Vec::new();
 
-    // Non-playable map players (Neutral, Creeps, etc.)
-    let non_playable: Vec<_> = map.players.iter()
-        .filter(|p| !p.playable)
-        .collect();
-
+    // Non-playable players (Neutral, Creeps, etc.)
+    let non_playable: Vec<_> = map.players.iter().filter(|p| !p.playable).collect();
     for _p in &non_playable {
         let id = next_id;
-        all_actor_ids.push(id);
-        player_actor_ids.push(id);
-        actor_kinds.insert(id, ActorKind::Player);
-        sync_actors.push(sync::ActorSync {
-            actor_id: id,
-            trait_hashes: player_trait_hashes(lobby.starting_cash, false),
+        actors.insert(id, Actor {
+            id,
+            kind: ActorKind::Player,
+            owner_id: None,
+            location: None,
+            traits: build_player_traits(lobby.starting_cash),
+            activity: None,
         });
+        player_actor_ids.push(id);
         next_id += 1;
     }
 
-    // Playable players (one per occupied lobby slot)
+    // Playable players
     for _slot in &lobby.occupied_slots {
         let id = next_id;
-        all_actor_ids.push(id);
-        player_actor_ids.push(id);
-        actor_kinds.insert(id, ActorKind::Player);
-        sync_actors.push(sync::ActorSync {
-            actor_id: id,
-            trait_hashes: player_trait_hashes(lobby.starting_cash, true),
+        actors.insert(id, Actor {
+            id,
+            kind: ActorKind::Player,
+            owner_id: None,
+            location: None,
+            traits: build_player_traits(lobby.starting_cash),
+            activity: None,
         });
+        player_actor_ids.push(id);
         next_id += 1;
     }
 
-    // "Everyone" spectator player — always created by CreateMapPlayers
-    // after non-playable and playable players.
-    let everyone_player_id;
-    {
-        let id = next_id;
-        all_actor_ids.push(id);
-        player_actor_ids.push(id);
-        actor_kinds.insert(id, ActorKind::Player);
-        sync_actors.push(sync::ActorSync {
-            actor_id: id,
-            trait_hashes: player_trait_hashes(lobby.starting_cash, false),
-        });
-        everyone_player_id = id;
-        next_id += 1;
-    }
+    // "Everyone" spectator player
+    let everyone_player_id = next_id;
+    actors.insert(next_id, Actor {
+        id: next_id,
+        kind: ActorKind::Player,
+        owner_id: None,
+        location: None,
+        traits: build_player_traits(lobby.starting_cash),
+        activity: None,
+    });
+    player_actor_ids.push(next_id);
+    next_id += 1;
 
     // === Map actors ===
-    // Collect spawn point locations for MCV placement.
     let mut spawn_locations: Vec<(i32, i32)> = Vec::new();
     let mut mine_count: usize = 0;
 
-    for actor in &map.actors {
+    for map_actor in &map.actors {
         let id = next_id;
-        all_actor_ids.push(id);
-        actor_locations.insert(id, actor.location);
         next_id += 1;
 
-        let mut trait_hashes = Vec::new();
+        let is_tree = map_actor.actor_type.starts_with('t')
+            && (map_actor.actor_type.len() == 3 || map_actor.actor_type.starts_with("tc"));
+        let is_mine = map_actor.actor_type == "mine";
+        let is_spawn = map_actor.actor_type == "mpspawn";
 
-        let is_tree = actor.actor_type.starts_with('t')
-            && (actor.actor_type.len() == 3 || actor.actor_type.starts_with("tc"));
-        let is_mine = actor.actor_type == "mine";
-        let is_spawn = actor.actor_type == "mpspawn";
-
-        let top_left = CPos::new(actor.location.0, actor.location.1);
+        let top_left = CPos::new(map_actor.location.0, map_actor.location.1);
+        let mut trait_list = Vec::new();
+        let kind;
 
         if is_tree {
-            actor_kinds.insert(id, ActorKind::Tree);
-            trait_hashes.push(1); // BodyOrientation: QuantizedFacings
-            trait_hashes.push(building_sync_hash(top_left));
-            trait_hashes.push(health_sync_hash(50000));
+            kind = ActorKind::Tree;
+            trait_list.push(TraitState::BodyOrientation { quantized_facings: 1 });
+            trait_list.push(TraitState::Building { top_left });
+            trait_list.push(TraitState::Health { hp: 50000 });
         } else if is_mine {
             mine_count += 1;
-            actor_kinds.insert(id, ActorKind::Mine);
-            trait_hashes.push(1); // BodyOrientation: QuantizedFacings
-            trait_hashes.push(building_sync_hash(top_left));
+            kind = ActorKind::Mine;
+            trait_list.push(TraitState::BodyOrientation { quantized_facings: 1 });
+            trait_list.push(TraitState::Building { top_left });
         } else if is_spawn {
-            spawn_locations.push(actor.location);
-            actor_kinds.insert(id, ActorKind::Spawn);
-            // Construction order: Immobile before BodyOrientation
-            let center = center_of_cell(actor.location.0, actor.location.1);
-            trait_hashes.push(immobile_sync_hash(top_left, center));
-            trait_hashes.push(1); // BodyOrientation: QuantizedFacings
+            spawn_locations.push(map_actor.location);
+            kind = ActorKind::Spawn;
+            let center = center_of_cell(map_actor.location.0, map_actor.location.1);
+            trait_list.push(TraitState::Immobile { top_left, center_position: center });
+            trait_list.push(TraitState::BodyOrientation { quantized_facings: 1 });
+        } else {
+            kind = ActorKind::World; // Unknown actor type
         }
 
-        if !trait_hashes.is_empty() {
-            sync_actors.push(sync::ActorSync {
-                actor_id: id,
-                trait_hashes,
-            });
-        }
+        actors.insert(id, Actor {
+            id,
+            kind,
+            owner_id: None,
+            location: Some(map_actor.location),
+            traits: trait_list,
+            activity: None,
+        });
     }
 
     // === Starting units (MCVs) ===
-    // "startingunits=none" in OpenRA actually means the "mcv-only" class,
-    // which spawns one MCV per playable player at their assigned spawn point.
-    // MCVs are created after all map actors.
-    //
-    // Spawn point assignment uses a separate playerRandom (same seed as SharedRandom).
-    // The playerRandom sequence during CreateMapPlayers:
-    //   - Non-playable players: ResolveFaction for each (allies faction has no
-    //     RandomFactionMembers, so no RNG consumption)
-    //   - Playable players: ResolveFaction (2 calls each for Random→RandomAllies/
-    //     RandomSoviet→specific) + AssignHomeLocation (1 call for first player,
-    //     0 for second since separateTeamSpawns uses MaxBy)
-    //   - "Everyone": ResolveFaction (2 calls)
-    //
-    // MCV facing is randomized via SharedRandom.Next(1024) per player
-    // in SpawnStartingUnits.WorldLoaded().
     let player_spawn_assignments = assign_spawn_points(
         &spawn_locations,
         lobby.occupied_slots.len(),
@@ -1183,67 +826,38 @@ pub fn build_world(
         &map.players,
     );
 
-    // MCV facing: BaseActorFacing defaults to WAngle(512) in StartingUnitsInfo,
-    // and the @mcvonly entry doesn't override it. So facing=512, NOT random.
-    // SharedRandom is NOT consumed for MCV facing.
-    let facing = 512;
+    let facing = 512; // BaseActorFacing default
     let num_non_playable = non_playable.len();
-    let mut mcv_states = Vec::new();
     for (pi, &(spawn_x, spawn_y)) in player_spawn_assignments.iter().enumerate() {
         let owner_pid = player_actor_ids[num_non_playable + pi];
         eprintln!("MCV[{}] spawn=({},{}) facing={} owner={}", pi, spawn_x, spawn_y, facing, owner_pid);
         let id = next_id;
-        all_actor_ids.push(id);
-        actor_locations.insert(id, (spawn_x, spawn_y));
-        actor_kinds.insert(id, ActorKind::Mcv);
-        actor_owners.insert(id, owner_pid);
-        sync_actors.push(sync::ActorSync {
-            actor_id: id,
-            trait_hashes: mcv_trait_hashes(spawn_x, spawn_y, facing),
-        });
-        mcv_states.push(McvState {
-            actor_id: id,
-            facing,
-            turn_target: 384,
-            is_turning: false,
-            turn_done: false,
-            turn_speed: 20, // YAML TurnSpeed: 20, with NetFrameInterval=3 (3 ticks/frame)
-            spawn_x,
-            spawn_y,
-            owner_player_id: owner_pid,
+        actors.insert(id, Actor {
+            id,
+            kind: ActorKind::Mcv,
+            owner_id: Some(owner_pid),
+            location: Some((spawn_x, spawn_y)),
+            traits: build_mcv_traits(spawn_x, spawn_y, facing),
+            activity: None,
         });
         next_id += 1;
     }
 
-    let mut player_cash = HashMap::new();
-    for &pid in &player_actor_ids {
-        player_cash.insert(pid, lobby.starting_cash);
-    }
-
     World {
-        all_actor_ids,
-        sync_actors,
+        actors,
         synced_effects: Vec::new(),
         rng,
-        unlocked_render_player_ids: Vec::new(),
-        paused: true, // Game starts paused during orderLatency buffer period
+        paused: true,
         world_tick: 0,
         frame_number: 0,
-        order_latency: 15, // Default for "normal" game speed
+        order_latency: 15,
         next_actor_id: next_id,
         frame_end_tasks: Vec::new(),
-        actor_locations,
         player_actor_ids,
-        pq_enabled: true,
-        mcv_states,
         everyone_player_id,
-        fal_state: HashMap::new(),
         mine_count,
-        seeds_resource_ticks: 0, // Fires on tick 1 (--ticks gives -1 ≤ 0)
+        seeds_resource_ticks: 0,
         production: HashMap::new(),
-        player_cash,
-        actor_kinds,
-        actor_owners,
         map_width: map.map_size.0,
         map_height: map.map_size.1,
     }
@@ -1263,51 +877,14 @@ mod tests {
     }
 
     #[test]
-    fn building_hash_matches_cpos_bits() {
-        let top_left = CPos::new(5, 10);
-        assert_eq!(building_sync_hash(top_left), top_left.bits);
-    }
-
-    #[test]
-    fn immobile_hash_xors_topleft_and_center() {
-        let top_left = CPos::new(5, 10);
-        let center = center_of_cell(5, 10);
-        let hash = immobile_sync_hash(top_left, center);
-        assert_eq!(hash, top_left.bits ^ center.sync_hash());
-    }
-
-    #[test]
-    fn bool_hash_values() {
-        // Due to IL quirk in C# Sync.cs: false→0, true→1
-        assert_eq!(hash_bool(true), 1);
-        assert_eq!(hash_bool(false), 0);
-    }
-
-    #[test]
-    fn developer_mode_7_false_bools() {
-        // 7 false bools XOR'd: all 0 → 0
-        assert_eq!(developer_mode_sync_hash(), 0);
-    }
-
-    #[test]
-    fn gps_watcher_4_false_bools() {
-        // 4 false bools XOR'd: all 0 → 0
-        assert_eq!(gps_watcher_sync_hash(), 0);
-    }
-
-    #[test]
-    fn production_queue_both_true() {
-        // true XOR true = 1 ^ 1 = 0
-        assert_eq!(production_queue_sync_hash(true, true), 0);
-    }
-
-    #[test]
     fn shroud_false_disabled() {
-        assert_eq!(shroud_sync_hash(), 0);
+        let t = TraitState::Shroud { disabled: false };
+        assert_eq!(t.sync_hash(), 0);
     }
 
     #[test]
     fn player_resources_5000_cash() {
-        assert_eq!(player_resources_sync_hash(5000), 5000);
+        let t = TraitState::PlayerResources { cash: 5000, resources: 0, resource_capacity: 0 };
+        assert_eq!(t.sync_hash(), 5000);
     }
 }
