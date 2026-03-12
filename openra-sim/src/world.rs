@@ -194,6 +194,8 @@ pub struct World {
     seeds_resource_ticks: i32,
     /// Active production items per player actor ID.
     production: HashMap<u32, Vec<ProductionItem>>,
+    /// Completed buildings waiting for PlaceBuilding order, per player.
+    completed_buildings: HashMap<u32, Vec<String>>,
     /// Terrain and occupancy map.
     pub terrain: TerrainMap,
     /// Map dimensions (cells).
@@ -257,6 +259,7 @@ impl World {
         for actor in self.actors.values() {
             if let Some(owner) = actor.owner_id {
                 if owner != player_id
+                    && owner != self.everyone_player_id
                     && matches!(actor.kind, ActorKind::Building | ActorKind::Infantry | ActorKind::Vehicle | ActorKind::Mcv)
                 {
                     return actor.location;
@@ -264,6 +267,135 @@ impl World {
             }
         }
         None
+    }
+
+    /// Check if the player has any items in production.
+    pub fn has_pending_production(&self, player_id: u32) -> bool {
+        self.production.get(&player_id).map(|items| !items.is_empty()).unwrap_or(false)
+    }
+
+    /// Check if the player has a unit (not building) in production.
+    pub fn has_pending_unit_production(&self, player_id: u32) -> bool {
+        self.production.get(&player_id)
+            .map(|items| items.iter().any(|item| self.rules.is_unit(&item.item_name)))
+            .unwrap_or(false)
+    }
+
+    /// Peek at completed building names for a player (non-draining).
+    pub fn peek_completed_buildings(&self, player_id: u32) -> Vec<String> {
+        self.completed_buildings.get(&player_id).cloned().unwrap_or_default()
+    }
+
+    /// Remove completed buildings after they've been placed.
+    pub fn drain_completed_buildings(&mut self, player_id: u32) {
+        self.completed_buildings.remove(&player_id);
+    }
+
+    /// Find the location of a specific building type owned by a player.
+    pub fn find_building_location(&self, player_id: u32, building_type: &str) -> Option<(i32, i32)> {
+        for actor in self.actors.values() {
+            if actor.owner_id == Some(player_id)
+                && actor.kind == ActorKind::Building
+                && actor.actor_type.as_deref() == Some(building_type)
+            {
+                return actor.location;
+            }
+        }
+        None
+    }
+
+    /// Get a player's power status (provided, drained).
+    pub fn player_power(&self, player_id: u32) -> (i32, i32) {
+        if let Some(player) = self.actors.get(&player_id) {
+            for t in &player.traits {
+                if let crate::traits::TraitState::PowerManager { power_provided, power_drained } = t {
+                    return (*power_provided, *power_drained);
+                }
+            }
+        }
+        (0, 0)
+    }
+
+    /// Get the cost of a building type from rules.
+    pub fn building_cost(&self, building_type: &str) -> i32 {
+        self.rules.cost(building_type)
+    }
+
+    /// Get the cost of a unit type from rules.
+    pub fn unit_cost(&self, unit_type: &str) -> i32 {
+        self.rules.cost(unit_type)
+    }
+
+    /// Check if an actor has no current activity (is idle).
+    pub fn is_actor_idle(&self, actor_id: u32) -> bool {
+        self.actors.get(&actor_id)
+            .map(|a| a.activity.is_none())
+            .unwrap_or(true)
+    }
+
+    /// Get actor type name.
+    pub fn actor_type_name(&self, actor_id: u32) -> Option<String> {
+        self.actors.get(&actor_id)
+            .and_then(|a| a.actor_type.clone())
+    }
+
+    /// Check if a building can be placed at the given location (all cells passable and unoccupied).
+    pub fn can_place_building(&self, x: i32, y: i32, w: i32, h: i32) -> bool {
+        for dy in 0..h {
+            for dx in 0..w {
+                if !self.terrain.is_passable(x + dx, y + dy) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Check if a player has been eliminated (no buildings, no MCV).
+    pub fn is_player_eliminated(&self, player_id: u32) -> bool {
+        // Non-playable players can't be eliminated
+        if player_id == self.everyone_player_id {
+            return false;
+        }
+        !self.actors.values().any(|a| {
+            a.owner_id == Some(player_id)
+                && matches!(a.kind, ActorKind::Building | ActorKind::Mcv)
+        })
+    }
+
+    /// Get playable player IDs (excluding non-playable and Everyone).
+    pub fn playable_player_ids(&self) -> Vec<u32> {
+        // Non-playable players come first, then playable, then Everyone.
+        // We return only the ones that own an MCV or building at game start.
+        self.player_actor_ids.iter()
+            .copied()
+            .filter(|&pid| pid != self.everyone_player_id)
+            .filter(|&pid| {
+                // Check if this player has any game actors (MCV, buildings, units)
+                self.actors.values().any(|a| {
+                    a.owner_id == Some(pid)
+                        && matches!(a.kind, ActorKind::Building | ActorKind::Mcv | ActorKind::Infantry | ActorKind::Vehicle)
+                })
+            })
+            .collect()
+    }
+
+    /// Check game result. Returns None if game is ongoing,
+    /// Some(winner_player_id) if one player remains.
+    pub fn check_winner(&self) -> Option<u32> {
+        if self.paused {
+            return None;
+        }
+        let alive: Vec<u32> = self.playable_player_ids().into_iter()
+            .filter(|&pid| !self.is_player_eliminated(pid))
+            .collect();
+        if alive.len() == 1 {
+            Some(alive[0])
+        } else if alive.is_empty() {
+            Some(0) // Draw — everyone dead
+        } else {
+            None // Game still going
+        }
     }
 
     /// Compute SyncHash components separately for debugging.
@@ -481,7 +613,13 @@ impl World {
                 if let Some(subject_id) = order.subject_id {
                     if let Some(ref ts) = order.target_string {
                         if let Some(target) = parse_cell_target(ts) {
+                            eprintln!("ORDER: AttackMove subject={} target={:?}", subject_id, target);
                             self.order_move(subject_id, target);
+                            // Mark as attack-moving so AutoTarget scans during movement
+                            if let Some(actor) = self.actors.get_mut(&subject_id) {
+                                actor.attack_move = true;
+                                actor.attack_move_dest = Some(target);
+                            }
                         }
                     }
                 }
@@ -544,7 +682,10 @@ impl World {
     fn order_move(&mut self, actor_id: u32, target: (i32, i32)) {
         let from = match self.actors.get(&actor_id).and_then(|a| a.location) {
             Some(loc) => loc,
-            None => return,
+            None => {
+                eprintln!("MOVE: actor {} has no location, skipping", actor_id);
+                return;
+            }
         };
         if let Some(path) = pathfinder::find_path(&self.terrain, from, target, Some(actor_id)) {
             if path.len() > 1 {
@@ -557,7 +698,11 @@ impl World {
                         speed,
                     });
                 }
+            } else {
+                eprintln!("MOVE: actor {} path too short from {:?} to {:?}", actor_id, from, target);
             }
+        } else {
+            eprintln!("MOVE: actor {} no path from {:?} to {:?}", actor_id, from, target);
         }
     }
 
@@ -672,6 +817,8 @@ impl World {
             ],
             activity: None,
             actor_type: Some(building_type.to_string()),
+            attack_move: false,
+            attack_move_dest: None,
         };
         self.actors.insert(building_id, building);
         self.terrain.occupy_footprint(x, y, footprint_w, footprint_h, building_id);
@@ -687,6 +834,11 @@ impl World {
 
         eprintln!("PLACE: {} at ({},{}) id={} footprint={}x{} power={}",
             building_type, x, y, building_id, footprint_w, footprint_h, power);
+
+        // C# FreeActor trait: refineries spawn a free harvester on placement
+        if building_type == "proc" {
+            self.spawn_unit_near("harv", owner_player_id, x, y, footprint_w, footprint_h);
+        }
     }
 
     /// Update PowerManager trait on a player actor.
@@ -724,6 +876,82 @@ impl World {
                     }
                 }
             }
+        }
+    }
+
+    /// AutoTarget: idle military units scan for nearby enemies and start attacking.
+    /// Mirrors C# AutoTarget.cs — units with no current activity (or completed move)
+    /// look for the nearest enemy in weapon range and auto-engage.
+    fn tick_auto_target(&mut self) {
+        // Collect idle military units that can attack, plus attack-moving units
+        let mut idle_attackers: Vec<(u32, (i32, i32), u32, i32)> = Vec::new(); // (id, loc, owner, sight_range)
+        for actor in self.actors.values() {
+            // Scan for: idle units (no activity) OR attack-moving units (Move + attack_move flag)
+            let should_scan = match &actor.activity {
+                None => true,
+                Some(Activity::Move { .. }) if actor.attack_move => true,
+                _ => false,
+            };
+            if !should_scan { continue; }
+            let owner = match actor.owner_id {
+                Some(o) => o,
+                None => continue,
+            };
+            let loc = match actor.location {
+                Some(l) => l,
+                None => continue,
+            };
+            match actor.kind {
+                ActorKind::Infantry | ActorKind::Vehicle => {}
+                _ => continue,
+            }
+            // Get sight range (used as scan range for auto-target)
+            let sight = actor.actor_type.as_deref()
+                .and_then(|at| self.rules.actor(at))
+                .map(|s| s.sight_range)
+                .unwrap_or(4);
+            idle_attackers.push((actor.id, loc, owner, sight));
+        }
+
+        // For each idle attacker, find nearest enemy in range
+        let mut new_attacks: Vec<(u32, u32)> = Vec::new(); // (attacker_id, target_id)
+        for (attacker_id, aloc, owner, sight) in &idle_attackers {
+            let mut best_target: Option<(u32, i32)> = None; // (target_id, distance)
+            for actor in self.actors.values() {
+                let target_owner = match actor.owner_id {
+                    Some(o) => o,
+                    None => continue,
+                };
+                // Must be enemy (not same player, not "everyone")
+                if target_owner == *owner || target_owner == self.everyone_player_id {
+                    continue;
+                }
+                let tloc = match actor.location {
+                    Some(l) => l,
+                    None => continue,
+                };
+                // Must be a valid target (not world/player/tree/mine/spawn actors)
+                match actor.kind {
+                    ActorKind::Infantry | ActorKind::Vehicle | ActorKind::Building | ActorKind::Mcv => {}
+                    _ => continue,
+                }
+                let dx = (aloc.0 - tloc.0).abs();
+                let dy = (aloc.1 - tloc.1).abs();
+                let dist = dx.max(dy); // Chebyshev distance
+                if dist <= *sight {
+                    if best_target.is_none() || dist < best_target.unwrap().1 {
+                        best_target = Some((actor.id, dist));
+                    }
+                }
+            }
+            if let Some((target_id, _)) = best_target {
+                new_attacks.push((*attacker_id, target_id));
+            }
+        }
+
+        // Issue attack orders for auto-targeted units
+        for (attacker_id, target_id) in new_attacks {
+            self.order_attack(attacker_id, target_id);
         }
     }
 
@@ -1286,9 +1514,28 @@ impl World {
                 }
             }
         }
-        // Apply damage
+        // Apply damage (with armor modifiers from weapon's Versus table)
         let mut dead_actors: Vec<u32> = Vec::new();
-        for (_attacker, target_id, damage) in &attacks {
+        for (attacker_id, target_id, base_damage) in &attacks {
+            // Look up attacker's weapon versus table and target's armor type
+            let versus = self.actors.get(attacker_id)
+                .and_then(|a| a.actor_type.as_deref())
+                .and_then(|at| self.rules.actor(at))
+                .and_then(|stats| stats.weapons.first())
+                .and_then(|wname| self.rules.weapon(wname))
+                .map(|w| &w.versus);
+            let target_armor = self.actors.get(target_id)
+                .and_then(|a| a.actor_type.as_deref())
+                .and_then(|at| self.rules.actor(at))
+                .map(|s| s.armor_type)
+                .unwrap_or(crate::gamerules::ArmorType::None);
+            // Apply armor modifier: damage = base_damage * versus_pct / 100
+            let modifier = versus
+                .and_then(|v| v.get(&target_armor))
+                .copied()
+                .unwrap_or(100); // Default 100% if no entry
+            let damage = *base_damage * modifier / 100;
+            if damage <= 0 { continue; }
             if let Some(target) = self.actors.get_mut(target_id) {
                 for t in &mut target.traits {
                     if let TraitState::Health { hp } = t {
@@ -1301,14 +1548,43 @@ impl World {
                 }
             }
         }
-        // Remove dead actors
-        for id in dead_actors {
-            if let Some(dead) = self.actors.remove(&id) {
+        // Remove dead actors and clear Attack activities targeting them
+        for id in &dead_actors {
+            if let Some(dead) = self.actors.remove(id) {
                 if let Some(loc) = dead.location {
                     self.terrain.clear_occupant(loc.0, loc.1);
                 }
             }
         }
+        // Clear Attack activities that target dead actors.
+        // For attack-moving units, queue resumption of movement to original destination.
+        let mut resume_move: Vec<(u32, (i32, i32))> = Vec::new();
+        if !dead_actors.is_empty() {
+            for actor in self.actors.values_mut() {
+                if let Some(Activity::Attack { target_id, .. }) = &actor.activity {
+                    if dead_actors.contains(target_id) {
+                        actor.activity = None;
+                        // If this was an attack-move unit, remember to resume movement
+                        if actor.attack_move {
+                            if let Some(dest) = actor.attack_move_dest {
+                                resume_move.push((actor.id, dest));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Resume movement for attack-move units whose targets died
+        for (actor_id, dest) in resume_move {
+            self.order_move(actor_id, dest);
+            if let Some(actor) = self.actors.get_mut(&actor_id) {
+                actor.attack_move = true; // Keep scanning
+            }
+        }
+
+        // AutoTarget: idle military units scan for nearby enemies and auto-attack.
+        // Matches C# AutoTarget behavior: units with no activity look for enemies in weapon range.
+        self.tick_auto_target();
 
         // Tick Harvest activities.
         self.tick_harvesters();
@@ -1347,15 +1623,17 @@ impl World {
                 }
             }
         }
-        // Spawn completed units
-        for (owner_pid, unit_type) in completed_items {
-            if self.rules.is_unit(&unit_type) {
+        // Spawn completed units, queue completed buildings for placement
+        for (owner_pid, item_type) in completed_items {
+            if self.rules.is_unit(&item_type) {
                 self.frame_end_tasks.push(FrameEndTask::SpawnUnit {
-                    unit_type,
+                    unit_type: item_type,
                     owner_player_id: owner_pid,
                 });
+            } else {
+                // Building completed — add to pending list for PlaceBuilding order
+                self.completed_buildings.entry(owner_pid).or_default().push(item_type);
             }
-            // Buildings wait for PlaceBuilding order
         }
 
         // Queue deploy for MCVs that finished turning
@@ -1436,10 +1714,85 @@ impl World {
             ],
             activity,
             actor_type: Some(unit_type.to_string()),
+            attack_move: false,
+            attack_move_dest: None,
         };
         self.actors.insert(unit_id, actor);
         self.terrain.set_occupant(x, y, unit_id);
         eprintln!("SPAWN: {} id={} at ({},{}) owner={} speed={} hp={}",
+            unit_type, unit_id, x, y, owner_player_id, speed, hp);
+    }
+
+    /// Spawn a unit near a specific building location (used for FreeActor, e.g. proc → harv).
+    fn spawn_unit_near(&mut self, unit_type: &str, owner_player_id: u32, bx: i32, by: i32, fw: i32, fh: i32) {
+        // Find passable cell adjacent to the building footprint
+        let mut spawn_loc = None;
+        for dy in -1..=fh {
+            for dx in -1..=fw {
+                let sx = bx + dx;
+                let sy = by + dy;
+                if self.terrain.is_passable(sx, sy) {
+                    spawn_loc = Some((sx, sy));
+                    break;
+                }
+            }
+            if spawn_loc.is_some() { break; }
+        }
+        let (x, y) = match spawn_loc {
+            Some(loc) => loc,
+            None => return,
+        };
+
+        let unit_id = self.next_actor_id;
+        self.next_actor_id += 1;
+
+        let (kind, speed, hp) = self.rules.actor(unit_type)
+            .map(|s| (s.kind, s.speed, s.hp))
+            .unwrap_or((ActorKind::Vehicle, 71, 100000));
+        let facing = 512;
+        let cell = CPos::new(x, y);
+        let center = center_of_cell(x, y);
+
+        // Harvesters auto-start harvesting
+        let activity = if unit_type == "harv" {
+            let refinery_id = self.find_refinery(owner_player_id).unwrap_or(0);
+            Some(Activity::Harvest {
+                state: HarvestState::FindingOre,
+                refinery_id,
+                carried_ore: 0,
+                carried_gems: 0,
+                capacity: 20,
+                path: Vec::new(),
+                path_index: 0,
+                speed,
+                harvest_ticks: 0,
+                last_harvest_cell: None,
+            })
+        } else {
+            None
+        };
+
+        let actor = Actor {
+            id: unit_id,
+            kind,
+            owner_id: Some(owner_player_id),
+            location: Some((x, y)),
+            traits: vec![
+                TraitState::BodyOrientation { quantized_facings: 32 },
+                TraitState::Mobile {
+                    facing, from_cell: cell, to_cell: cell,
+                    center_position: center,
+                },
+                TraitState::Health { hp },
+            ],
+            activity,
+            actor_type: Some(unit_type.to_string()),
+            attack_move: false,
+            attack_move_dest: None,
+        };
+        self.actors.insert(unit_id, actor);
+        self.terrain.set_occupant(x, y, unit_id);
+        eprintln!("SPAWN: {} id={} at ({},{}) owner={} speed={} hp={} (free from proc)",
             unit_type, unit_id, x, y, owner_player_id, speed, hp);
     }
 
@@ -1557,6 +1910,8 @@ impl World {
             ],
             activity: None,
             actor_type: Some("fact".to_string()),
+            attack_move: false,
+            attack_move_dest: None,
         };
         self.actors.insert(fact_id, fact_actor);
 
@@ -1783,6 +2138,8 @@ pub fn build_world(
         traits: vec![TraitState::DebugPauseState { paused: true }],
         activity: None,
         actor_type: None,
+        attack_move: false,
+        attack_move_dest: None,
     });
     next_id += 1;
 
@@ -1801,6 +2158,8 @@ pub fn build_world(
             traits: build_player_traits(lobby.starting_cash),
             activity: None,
             actor_type: None,
+            attack_move: false,
+            attack_move_dest: None,
         });
         player_actor_ids.push(id);
         next_id += 1;
@@ -1817,6 +2176,8 @@ pub fn build_world(
             traits: build_player_traits(lobby.starting_cash),
             activity: None,
             actor_type: None,
+            attack_move: false,
+            attack_move_dest: None,
         });
         player_actor_ids.push(id);
         next_id += 1;
@@ -1832,6 +2193,8 @@ pub fn build_world(
         traits: build_player_traits(lobby.starting_cash),
         activity: None,
         actor_type: None,
+        attack_move: false,
+        attack_move_dest: None,
     });
     player_actor_ids.push(next_id);
     next_id += 1;
@@ -1881,6 +2244,8 @@ pub fn build_world(
             traits: trait_list,
             activity: None,
             actor_type: Some(map_actor.actor_type.clone()),
+            attack_move: false,
+            attack_move_dest: None,
         });
     }
 
@@ -1906,6 +2271,8 @@ pub fn build_world(
             traits: build_mcv_traits(spawn_x, spawn_y, facing),
             activity: None,
             actor_type: Some("mcv".to_string()),
+            attack_move: false,
+            attack_move_dest: None,
         });
         next_id += 1;
     }
@@ -1971,6 +2338,7 @@ pub fn build_world(
         mine_count,
         seeds_resource_ticks: 0,
         production: HashMap::new(),
+        completed_buildings: HashMap::new(),
         terrain,
         map_width: map.map_size.0,
         map_height: map.map_size.1,

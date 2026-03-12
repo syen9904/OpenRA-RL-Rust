@@ -96,6 +96,11 @@ pub struct Actor {
     /// Actor type name from rules (e.g., "fact", "2tnk", "e1").
     /// Not synced — used for game logic lookups.
     pub actor_type: Option<String>,
+    /// If true, this unit was given an AttackMove order and should scan for
+    /// enemies while moving (interrupt move to attack, resume when target dies).
+    pub attack_move: bool,
+    /// Original AttackMove destination — resume movement here after attacking.
+    pub attack_move_dest: Option<(i32, i32)>,
 }
 
 impl Actor {
