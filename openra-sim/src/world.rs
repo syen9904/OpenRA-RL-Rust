@@ -219,6 +219,46 @@ impl World {
         )
     }
 
+    /// Get a player's cash.
+    pub fn player_cash(&self, player_id: u32) -> i32 {
+        self.actors.get(&player_id).map(|a| a.cash()).unwrap_or(0)
+    }
+
+    /// Get actor IDs owned by a player.
+    pub fn actor_ids_for_player(&self, player_id: u32) -> Vec<u32> {
+        self.actors.values()
+            .filter(|a| a.owner_id == Some(player_id))
+            .map(|a| a.id)
+            .collect()
+    }
+
+    /// Get the kind of an actor.
+    pub fn actor_kind(&self, actor_id: u32) -> Option<ActorKind> {
+        self.actors.get(&actor_id).map(|a| a.kind)
+    }
+
+    /// Get building types owned by a player.
+    pub fn player_building_types(&self, player_id: u32) -> Vec<String> {
+        self.actors.values()
+            .filter(|a| a.owner_id == Some(player_id) && a.kind == ActorKind::Building)
+            .filter_map(|a| a.actor_type.clone())
+            .collect()
+    }
+
+    /// Find the location of an enemy unit or building.
+    pub fn find_enemy_location(&self, player_id: u32) -> Option<(i32, i32)> {
+        for actor in self.actors.values() {
+            if let Some(owner) = actor.owner_id {
+                if owner != player_id
+                    && matches!(actor.kind, ActorKind::Building | ActorKind::Infantry | ActorKind::Vehicle | ActorKind::Mcv)
+                {
+                    return actor.location;
+                }
+            }
+        }
+        None
+    }
+
     /// Compute SyncHash components separately for debugging.
     pub fn sync_hash_debug(&self) -> SyncHashDebug {
         let actor_ids: Vec<u32> = self.actors.keys().copied().collect();
