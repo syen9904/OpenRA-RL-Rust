@@ -453,24 +453,121 @@ pub fn parse(data: &[u8]) -> io::Result<Replay> {
     })
 }
 
+/// Lobby settings extracted from the replay's SyncInfo.
+#[derive(Debug, Clone)]
+pub struct LobbySettings {
+    pub random_seed: i32,
+    pub starting_cash: i32,
+    pub allow_spectators: bool,
+    /// Occupied slots in order: (slot_name, player_reference, client_faction)
+    pub occupied_slots: Vec<(String, String, String)>,
+}
+
 impl Replay {
     /// Extract the RandomSeed from the SyncInfo lobby order.
-    /// The seed is in GlobalSettings/RandomSeed in the SyncInfo target_string.
     pub fn random_seed(&self) -> Option<i32> {
+        self.lobby_settings().map(|s| s.random_seed)
+    }
+
+    /// Extract the last (most complete) SyncInfo from the replay.
+    fn last_sync_info(&self) -> Option<&str> {
+        let mut last = None;
         for (_frame, order) in &self.orders {
             if order.order_string == "SyncInfo" {
                 if let Some(ref ts) = order.target_string {
-                    for line in ts.lines() {
-                        let trimmed = line.trim();
-                        if trimmed.starts_with("RandomSeed:") {
-                            let val = trimmed["RandomSeed:".len()..].trim();
-                            return val.parse().ok();
-                        }
-                    }
+                    last = Some(ts.as_str());
                 }
             }
         }
-        None
+        last
+    }
+
+    /// Parse full lobby settings from the replay's SyncInfo orders.
+    pub fn lobby_settings(&self) -> Option<LobbySettings> {
+        let yaml = self.last_sync_info()?;
+        let lines: Vec<&str> = yaml.lines().collect();
+
+        let mut random_seed = 0i32;
+        let mut starting_cash = 5000i32;
+        let mut allow_spectators = true;
+
+        // Parse GlobalSettings
+        let mut in_startingcash = false;
+        for line in &lines {
+            let trimmed = line.trim();
+            if trimmed.starts_with("RandomSeed:") {
+                random_seed = trimmed["RandomSeed:".len()..].trim().parse().ok()?;
+            } else if trimmed.starts_with("AllowSpectators:") {
+                allow_spectators = trimmed["AllowSpectators:".len()..].trim() == "True";
+            } else if trimmed == "startingcash:" {
+                in_startingcash = true;
+                continue;
+            }
+            if in_startingcash && trimmed.starts_with("Value:") {
+                starting_cash = trimmed["Value:".len()..].trim().parse().unwrap_or(5000);
+                in_startingcash = false;
+            }
+        }
+
+        // Parse slot definitions in order
+        let mut slots: Vec<(String, String)> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("Slot@") && trimmed.ends_with(':') {
+                let slot_name = &trimmed["Slot@".len()..trimmed.len() - 1];
+                let mut player_ref = slot_name.to_string();
+                for j in (i + 1)..lines.len() {
+                    let inner = lines[j].trim();
+                    if inner.starts_with("PlayerReference:") {
+                        player_ref = inner["PlayerReference:".len()..].trim().to_string();
+                        break;
+                    }
+                    if !lines[j].starts_with('\t') && !lines[j].starts_with("  ") {
+                        break;
+                    }
+                }
+                slots.push((slot_name.to_string(), player_ref));
+            }
+        }
+
+        // Parse clients with their slot assignments
+        let mut client_slots: Vec<(String, String)> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("Client@") && trimmed.ends_with(':') {
+                let mut slot = String::new();
+                let mut faction = String::from("Random");
+                for j in (i + 1)..lines.len() {
+                    let inner = lines[j].trim();
+                    if inner.starts_with("Slot:") {
+                        slot = inner["Slot:".len()..].trim().to_string();
+                    } else if inner.starts_with("Faction:") {
+                        faction = inner["Faction:".len()..].trim().to_string();
+                    }
+                    if !lines[j].starts_with('\t') && !lines[j].starts_with("  ") {
+                        break;
+                    }
+                }
+                if !slot.is_empty() {
+                    client_slots.push((slot, faction));
+                }
+            }
+        }
+
+        // Match slots to clients in slot definition order
+        let mut occupied = Vec::new();
+        for (slot_name, player_ref) in &slots {
+            if let Some((_, faction)) = client_slots.iter().find(|(s, _)| s == slot_name) {
+                occupied.push((slot_name.clone(), player_ref.clone(), faction.clone()));
+            }
+        }
+
+        Some(LobbySettings {
+            random_seed,
+            starting_cash,
+            allow_spectators,
+            occupied_slots: occupied,
+        })
     }
 }
 

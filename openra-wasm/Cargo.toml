@@ -1,6 +1,6 @@
 [package]
 name = "openra-wasm"
-description = "Browser replay viewer — WebGL renderer compiled to WASM"
+description = "Browser replay viewer — Canvas2D renderer compiled to WASM"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,3 +11,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 openra-sim = { path = "../openra-sim" }
 openra-data = { path = "../openra-data" }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "console",
+] }
+console_error_panic_hook = "0.1"

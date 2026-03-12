@@ -43,5 +43,10 @@ fn parse_singles_map() {
 
     let spawn_count = map.actors.iter().filter(|a| a.actor_type == "mpspawn").count();
     eprintln!("\nSpawn points: {}", spawn_count);
+    for (i, a) in map.actors.iter().enumerate() {
+        if a.actor_type == "mpspawn" {
+            eprintln!("  mpspawn #{}: location=({},{}) owner={}", i, a.location.0, a.location.1, a.owner);
+        }
+    }
     assert_eq!(spawn_count, 2);
 }
