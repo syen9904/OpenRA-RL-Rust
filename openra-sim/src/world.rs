@@ -7,6 +7,8 @@
 use crate::math::{CPos, WPos};
 use crate::rng::MersenneTwister;
 use crate::sync;
+use serde::Serialize;
+use std::collections::HashMap;
 
 /// Bool hash values matching C# Sync.cs EmitSyncOpcodes:
 ///
@@ -65,6 +67,45 @@ pub struct GameOrder {
     pub extra_data: Option<u32>,
 }
 
+/// Actor kind for rendering purposes.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum ActorKind {
+    World,
+    Player,
+    Tree,
+    Mine,
+    Spawn,
+    Mcv,
+    Building,
+}
+
+/// Snapshot of the world state for rendering.
+#[derive(Debug, Serialize)]
+pub struct WorldSnapshot {
+    pub tick: u32,
+    pub actors: Vec<ActorSnapshot>,
+    pub players: Vec<PlayerSnapshot>,
+    pub map_width: i32,
+    pub map_height: i32,
+}
+
+/// Snapshot of a single actor.
+#[derive(Debug, Serialize)]
+pub struct ActorSnapshot {
+    pub id: u32,
+    pub kind: ActorKind,
+    pub owner: u32,
+    pub x: i32,
+    pub y: i32,
+}
+
+/// Snapshot of a player.
+#[derive(Debug, Serialize)]
+pub struct PlayerSnapshot {
+    pub index: u32,
+    pub cash: i32,
+}
+
 /// The game world state.
 pub struct World {
     /// All actors in creation order (ActorID order).
@@ -90,7 +131,7 @@ pub struct World {
     /// Pending frame-end tasks (actor removals/creations from Transform, etc.)
     frame_end_tasks: Vec<FrameEndTask>,
     /// Actor cell locations (actor_id → (x, y)) for position lookups.
-    actor_locations: std::collections::HashMap<u32, (i32, i32)>,
+    actor_locations: HashMap<u32, (i32, i32)>,
     /// Player actor IDs (for PQ state updates, etc.)
     player_actor_ids: Vec<u32>,
     /// PQ trait indices within each player's sync trait list (offsets 6-11).
@@ -102,15 +143,22 @@ pub struct World {
     everyone_player_id: u32,
     /// FrozenActorLayer state per player: (FrozenHash, VisibilityHash).
     /// Tracked separately so we can compute FH ^ VH correctly.
-    fal_state: std::collections::HashMap<u32, (i32, i32)>,
+    fal_state: HashMap<u32, (i32, i32)>,
     /// Number of MINE actors on the map (for SeedsResource RNG consumption).
     mine_count: usize,
     /// Ticks until next SeedsResource seeding event.
     seeds_resource_ticks: i32,
     /// Active production items per player actor ID.
-    production: std::collections::HashMap<u32, Vec<ProductionItem>>,
+    production: HashMap<u32, Vec<ProductionItem>>,
     /// Current cash per player actor ID (for production consumption).
-    player_cash: std::collections::HashMap<u32, i32>,
+    player_cash: HashMap<u32, i32>,
+    /// Actor kind by ID (for rendering snapshots).
+    actor_kinds: HashMap<u32, ActorKind>,
+    /// Actor owner player ID by actor ID.
+    actor_owners: HashMap<u32, u32>,
+    /// Map dimensions (cells).
+    map_width: i32,
+    map_height: i32,
 }
 
 /// Mutable state for an MCV actor during deployment.
@@ -221,6 +269,34 @@ impl World {
         let rng_last = self.rng.last;
         let full = self.sync_hash();
         SyncHashDebug { full, identity, traits, rng_last }
+    }
+
+    /// Create a snapshot of the current world state for rendering.
+    pub fn snapshot(&self) -> WorldSnapshot {
+        let mut actors = Vec::new();
+        for &id in &self.all_actor_ids {
+            let kind = self.actor_kinds.get(&id).copied().unwrap_or(ActorKind::World);
+            // Skip non-renderable actors
+            if kind == ActorKind::World || kind == ActorKind::Player || kind == ActorKind::Spawn {
+                continue;
+            }
+            let owner = self.actor_owners.get(&id).copied().unwrap_or(0);
+            let (x, y) = self.actor_locations.get(&id).copied().unwrap_or((0, 0));
+            actors.push(ActorSnapshot { id, kind, owner, x, y });
+        }
+        let players: Vec<PlayerSnapshot> = self.player_actor_ids.iter().map(|&pid| {
+            PlayerSnapshot {
+                index: pid,
+                cash: self.player_cash.get(&pid).copied().unwrap_or(0),
+            }
+        }).collect();
+        WorldSnapshot {
+            tick: self.world_tick,
+            actors,
+            players,
+            map_width: self.map_width,
+            map_height: self.map_height,
+        }
     }
 
     /// Dump per-actor, per-trait contributions for debugging.
@@ -494,6 +570,8 @@ impl World {
         self.all_actor_ids.retain(|&id| id != mcv_actor_id);
         self.sync_actors.retain(|a| a.actor_id != mcv_actor_id);
         self.mcv_states.retain(|m| m.actor_id != mcv_actor_id);
+        self.actor_kinds.remove(&mcv_actor_id);
+        self.actor_owners.remove(&mcv_actor_id);
 
         // Create Construction Yard (fact) with new actor ID
         let fact_id = self.next_actor_id;
@@ -534,6 +612,8 @@ impl World {
         self.sync_actors.insert(sync_pos, fact_sync);
 
         self.actor_locations.insert(fact_id, fact_location);
+        self.actor_kinds.insert(fact_id, ActorKind::Building);
+        self.actor_owners.insert(fact_id, owner_player_id);
 
         eprintln!("DEPLOY: created FACT actor {} at {:?} TopLeft.bits={}",
             fact_id, fact_location, top_left.bits);
@@ -967,12 +1047,15 @@ pub fn build_world(
     let mut rng = MersenneTwister::new(random_seed);
     let mut all_actor_ids: Vec<u32> = Vec::new();
     let mut sync_actors: Vec<sync::ActorSync> = Vec::new();
-    let mut actor_locations: std::collections::HashMap<u32, (i32, i32)> = std::collections::HashMap::new();
+    let mut actor_locations: HashMap<u32, (i32, i32)> = HashMap::new();
+    let mut actor_kinds: HashMap<u32, ActorKind> = HashMap::new();
+    let mut actor_owners: HashMap<u32, u32> = HashMap::new();
     let mut next_id: u32 = 0;
 
     // === Actor ID 0: World actor ===
     // ISync traits: DebugPauseState (1 bool: IsWorldPaused = false at tick 0)
     all_actor_ids.push(next_id);
+    actor_kinds.insert(next_id, ActorKind::World);
     sync_actors.push(sync::ActorSync {
         actor_id: next_id,
         trait_hashes: vec![hash_bool(true)], // DebugPauseState: IsWorldPaused=true at tick 0
@@ -993,6 +1076,7 @@ pub fn build_world(
         let id = next_id;
         all_actor_ids.push(id);
         player_actor_ids.push(id);
+        actor_kinds.insert(id, ActorKind::Player);
         sync_actors.push(sync::ActorSync {
             actor_id: id,
             trait_hashes: player_trait_hashes(lobby.starting_cash, false),
@@ -1005,6 +1089,7 @@ pub fn build_world(
         let id = next_id;
         all_actor_ids.push(id);
         player_actor_ids.push(id);
+        actor_kinds.insert(id, ActorKind::Player);
         sync_actors.push(sync::ActorSync {
             actor_id: id,
             trait_hashes: player_trait_hashes(lobby.starting_cash, true),
@@ -1019,6 +1104,7 @@ pub fn build_world(
         let id = next_id;
         all_actor_ids.push(id);
         player_actor_ids.push(id);
+        actor_kinds.insert(id, ActorKind::Player);
         sync_actors.push(sync::ActorSync {
             actor_id: id,
             trait_hashes: player_trait_hashes(lobby.starting_cash, false),
@@ -1048,15 +1134,18 @@ pub fn build_world(
         let top_left = CPos::new(actor.location.0, actor.location.1);
 
         if is_tree {
+            actor_kinds.insert(id, ActorKind::Tree);
             trait_hashes.push(1); // BodyOrientation: QuantizedFacings
             trait_hashes.push(building_sync_hash(top_left));
             trait_hashes.push(health_sync_hash(50000));
         } else if is_mine {
             mine_count += 1;
+            actor_kinds.insert(id, ActorKind::Mine);
             trait_hashes.push(1); // BodyOrientation: QuantizedFacings
             trait_hashes.push(building_sync_hash(top_left));
         } else if is_spawn {
             spawn_locations.push(actor.location);
+            actor_kinds.insert(id, ActorKind::Spawn);
             // Construction order: Immobile before BodyOrientation
             let center = center_of_cell(actor.location.0, actor.location.1);
             trait_hashes.push(immobile_sync_hash(top_left, center));
@@ -1106,6 +1195,8 @@ pub fn build_world(
         let id = next_id;
         all_actor_ids.push(id);
         actor_locations.insert(id, (spawn_x, spawn_y));
+        actor_kinds.insert(id, ActorKind::Mcv);
+        actor_owners.insert(id, owner_pid);
         sync_actors.push(sync::ActorSync {
             actor_id: id,
             trait_hashes: mcv_trait_hashes(spawn_x, spawn_y, facing),
@@ -1124,7 +1215,7 @@ pub fn build_world(
         next_id += 1;
     }
 
-    let mut player_cash = std::collections::HashMap::new();
+    let mut player_cash = HashMap::new();
     for &pid in &player_actor_ids {
         player_cash.insert(pid, lobby.starting_cash);
     }
@@ -1146,11 +1237,15 @@ pub fn build_world(
         pq_enabled: true,
         mcv_states,
         everyone_player_id,
-        fal_state: std::collections::HashMap::new(),
+        fal_state: HashMap::new(),
         mine_count,
         seeds_resource_ticks: 0, // Fires on tick 1 (--ticks gives -1 ≤ 0)
-        production: std::collections::HashMap::new(),
-        player_cash: player_cash,
+        production: HashMap::new(),
+        player_cash,
+        actor_kinds,
+        actor_owners,
+        map_width: map.map_size.0,
+        map_height: map.map_size.1,
     }
 }
 

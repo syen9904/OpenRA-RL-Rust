@@ -5,6 +5,7 @@ Cargo.lock
 
 # WASM
 /openra-wasm/pkg/
+/openra-wasm/www/pkg/
 
 # IDE
 .idea/
